@@ -1,0 +1,2 @@
+# Nodes to exclude from GPU jobs, one per line (for example nodes whose CUDA warm-up
+# fails). Submitters pass the list to sbatch as --exclude; an empty list excludes nothing.

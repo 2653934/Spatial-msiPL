@@ -1,0 +1,691 @@
+"""Loss and training helpers for the Spatial-msiPL VAE."""
+
+import json
+import random
+import time
+from pathlib import Path
+
+import numpy as np
+import torch
+import torch.nn.functional as functional
+from torch.utils.data import DataLoader, Subset
+
+
+def set_random_seed(seed, include_cuda=False):
+    """Seed CPU libraries and, only when requested, PyTorch CUDA generators."""
+    random.seed(seed)
+    np.random.seed(seed)
+    # torch.manual_seed also probes CUDA in this PyTorch build. Seed the CPU
+    # generator directly so CPU-only validation does not emit GPU warnings.
+    torch.random.default_generator.manual_seed(seed)
+    if include_cuda:
+        if not torch.cuda.is_available():
+            raise RuntimeError("CUDA seeding was requested but CUDA is unavailable")
+        torch.cuda.manual_seed_all(seed)
+
+
+def msipl_vae_loss(reconstruction, target, mean, log_variance, beta=1.0):
+    """Return total, reconstruction, and KL losses.
+
+    The reconstruction term reproduces msiPL's categorical cross-entropy rule.
+    Decoder values are normalized across m/z before cross-entropy is calculated,
+    just as Keras does for categorical predictions. ``beta`` is retained as an
+    explicit parameter but is 1.0 for the standard VAE used in this task.
+    """
+    if reconstruction.shape != target.shape:
+        raise ValueError("reconstruction and target must have the same shape")
+    if mean.shape != log_variance.shape:
+        raise ValueError("mean and log_variance must have the same shape")
+
+    epsilon = torch.finfo(reconstruction.dtype).eps
+    probabilities = reconstruction / reconstruction.sum(dim=1, keepdim=True).clamp_min(epsilon)
+    probabilities = probabilities.clamp(min=epsilon, max=1.0 - epsilon)
+    reconstruction_per_sample = -(
+        target * torch.log(probabilities)
+    ).sum(dim=1) * target.shape[1]
+    reconstruction_loss = reconstruction_per_sample.mean()
+
+    kl_per_sample = -0.5 * torch.sum(
+        1.0 + log_variance - mean.pow(2) - log_variance.exp(), dim=1
+    )
+    kl_loss = kl_per_sample.mean()
+    total_loss = reconstruction_loss + float(beta) * kl_loss
+    return total_loss, reconstruction_loss, kl_loss
+
+
+def latent_spatial_coherence_loss(mean, x_coordinates, y_coordinates):
+    """Penalise latent-mean differences between adjacent measured pixels.
+
+    Adjacency uses the eight-position Moore neighbourhood already used by the
+    contextual input.  Each unordered pair is counted once.  The loss is the
+    mean squared latent difference across adjacent pairs and latent dimensions.
+    A batch with no adjacent pair returns a differentiable zero.
+    """
+    if mean.ndim != 2:
+        raise ValueError("mean must have shape (batch, latent dimensions)")
+    x = torch.as_tensor(x_coordinates, device=mean.device).reshape(-1)
+    y = torch.as_tensor(y_coordinates, device=mean.device).reshape(-1)
+    if len(x) != len(mean) or len(y) != len(mean):
+        raise ValueError("coordinates and latent means must have equal batch size")
+
+    delta_x = (x[:, None] - x[None, :]).abs()
+    delta_y = (y[:, None] - y[None, :]).abs()
+    adjacent = (torch.maximum(delta_x, delta_y) == 1).triu(diagonal=1)
+    pair_indices = adjacent.nonzero(as_tuple=False)
+    pair_count = int(pair_indices.shape[0])
+    if pair_count == 0:
+        return mean.sum() * 0.0, 0
+
+    differences = mean[pair_indices[:, 0]] - mean[pair_indices[:, 1]]
+    return differences.pow(2).mean(), pair_count
+
+
+def poisson_augment_tic_normalized(spectra, effective_count, generator=None):
+    """Apply count-aware Poisson noise and restore TIC normalization.
+
+    ``spectra`` may contain any number of leading dimensions, but its final
+    dimension must be the m/z axis.  Each non-zero spectrum is interpreted as
+    a probability distribution over an explicitly recorded effective ion
+    count ``N``.  We draw ``Poisson(spectrum * N)`` independently per bin and
+    renormalize the sampled counts to sum to one.  Zero spectra (used for
+    missing neighbour slots) remain zero.
+
+    An explicit effective count is necessary because the training data have
+    already been TIC-normalized.  Applying ``Poisson(spectrum)`` directly
+    would imply only one expected ion per spectrum and destroy almost all
+    spectral information.
+    """
+    if effective_count is None or float(effective_count) <= 0:
+        raise ValueError("effective_count must be positive")
+    if spectra.ndim < 1:
+        raise ValueError("spectra must include an m/z dimension")
+    if not torch.is_floating_point(spectra):
+        raise TypeError("spectra must be floating point")
+    if not bool(torch.isfinite(spectra).all()):
+        raise ValueError("spectra contain non-finite values")
+    if bool((spectra < 0).any()):
+        raise ValueError("spectra contain negative intensities")
+
+    sampled_counts = torch.poisson(
+        spectra * float(effective_count), generator=generator
+    )
+    sampled_totals = sampled_counts.sum(dim=-1, keepdim=True)
+    noisy = sampled_counts / sampled_totals.clamp_min(1.0)
+    # A non-zero spectrum can very rarely draw zero total counts at very small
+    # N. Falling back to the clean input avoids producing an invalid target.
+    return torch.where(sampled_totals > 0, noisy, spectra)
+
+
+def apply_centre_mask(central, probability, generator):
+    """Zero whole centre spectra in the encoder input with the given probability.
+
+    One uniform draw per row comes from ``generator`` (a CPU generator of its
+    own, so the model, loader and Poisson streams are untouched). Returns the
+    encoder input and the boolean row mask. ``central`` itself is not modified;
+    the caller keeps it as the unmasked reconstruction target.
+    """
+    if not 0.0 <= probability <= 1.0:
+        raise ValueError("centre mask probability must lie in [0, 1]")
+    draws = torch.rand(central.shape[0], generator=generator)
+    masked = (draws < probability).to(central.device)
+    encoder_input = torch.where(masked.unsqueeze(1), torch.zeros_like(central), central)
+    return encoder_input, masked
+
+
+def select_training_indices(dataset_size, maximum_samples, seed):
+    """Select a fixed random subset, or every index when no limit is requested."""
+    if maximum_samples is None or maximum_samples >= dataset_size:
+        return list(range(dataset_size))
+    if maximum_samples < 2:
+        raise ValueError("maximum_samples must be at least 2")
+    generator = np.random.default_rng(seed)
+    return sorted(generator.choice(dataset_size, size=maximum_samples, replace=False).tolist())
+
+
+def _atomic_json_write(path, value):
+    """Write JSON through a temporary file so interruption cannot truncate it."""
+    temporary_path = path.with_name(f"{path.name}.tmp")
+    temporary_path.write_text(json.dumps(value, indent=2), encoding="utf-8")
+    temporary_path.replace(path)
+
+
+def _atomic_torch_save(value, path):
+    """Write a PyTorch checkpoint atomically on the same filesystem."""
+    temporary_path = path.with_name(f"{path.name}.tmp")
+    torch.save(value, temporary_path)
+    temporary_path.replace(path)
+
+
+def _optimizer_to(optimizer, device):
+    """Move optimizer tensors restored from a CPU checkpoint to the target device."""
+    for state in optimizer.state.values():
+        for name, value in state.items():
+            if torch.is_tensor(value):
+                state[name] = value.to(device)
+
+
+def _capture_random_state(include_cuda):
+    state = {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch_cpu": torch.get_rng_state(),
+    }
+    if include_cuda:
+        state["torch_cuda"] = torch.cuda.get_rng_state_all()
+    return state
+
+
+def _restore_random_state(state, include_cuda):
+    random.setstate(state["python"])
+    np.random.set_state(state["numpy"])
+    torch.set_rng_state(state["torch_cpu"].cpu())
+    if include_cuda:
+        torch.cuda.set_rng_state_all(
+            [generator_state.cpu() for generator_state in state["torch_cuda"]]
+        )
+
+
+def train_vae(
+    model,
+    dataset,
+    output_directory,
+    checkpoint_directory=None,
+    epochs=1,
+    batch_size=4,
+    learning_rate=1e-3,
+    beta=1.0,
+    spatial_lambda=0.0,
+    spatial_loss_scale=1.0,
+    poisson_effective_count=None,
+    maximum_samples=None,
+    seed=1,
+    device="cpu",
+    experiment_metadata=None,
+    save_checkpoint=True,
+    checkpoint_interval=0,
+    resume_checkpoint=None,
+    centre_mask_probability=0.0,
+    centre_mask_seed=None,
+    snapshot_epochs=(),
+):
+    """Train a VAE with optional exact epoch-boundary checkpoint/resume support.
+
+    ``snapshot_epochs`` (training-length analysis) saves a full checkpoint payload
+    as ``snapshot_epoch<NNN>.pt`` in the checkpoint directory after each listed
+    epoch below ``epochs``. Saving reads state only, so training is unchanged; at
+    () (the default) nothing is saved and training is the historical code path.
+
+    ``centre_mask_probability`` > 0 (item G) zeroes the centre spectrum fed to
+    the model for that fraction of training samples, drawn from a separate
+    generator seeded with ``centre_mask_seed``; neighbours and the decoder
+    target are unchanged. At 0 (the default) nothing is drawn and training is
+    the historical code path.
+    """
+    if epochs < 1:
+        raise ValueError("epochs must be at least 1")
+    if batch_size < 2:
+        raise ValueError("batch_size must be at least 2 because the model uses batch normalization")
+    if checkpoint_interval < 0:
+        raise ValueError("checkpoint_interval cannot be negative")
+    snapshot_epochs = tuple(sorted(set(int(e) for e in snapshot_epochs)))
+    if snapshot_epochs and (snapshot_epochs[0] < 1 or snapshot_epochs[-1] >= epochs):
+        raise ValueError("snapshot_epochs must lie in [1, epochs - 1]")
+    if snapshot_epochs and not save_checkpoint:
+        raise ValueError("snapshot_epochs requires save_checkpoint=True")
+    if spatial_lambda < 0:
+        raise ValueError("spatial_lambda cannot be negative")
+    if spatial_loss_scale <= 0:
+        raise ValueError("spatial_loss_scale must be positive")
+    if poisson_effective_count is not None and poisson_effective_count <= 0:
+        raise ValueError("poisson_effective_count must be positive when enabled")
+    if resume_checkpoint is not None and not save_checkpoint:
+        raise ValueError("resume_checkpoint requires save_checkpoint=True")
+    centre_masking = centre_mask_probability > 0
+    if not 0.0 <= centre_mask_probability <= 1.0:
+        raise ValueError("centre_mask_probability must lie in [0, 1]")
+    if centre_masking and centre_mask_seed is None:
+        raise ValueError("centre masking requires an explicit centre_mask_seed")
+    if centre_masking and poisson_effective_count is not None:
+        raise ValueError("centre masking and Poisson augmentation are not combined")
+    if centre_masking and not getattr(model, "uses_neighbourhood_batch", False):
+        raise ValueError("centre masking requires the separate neighbourhood batch interface")
+
+    torch_device = torch.device(device)
+    uses_cuda = torch_device.type == "cuda"
+    set_random_seed(seed, include_cuda=uses_cuda)
+    selected_indices = select_training_indices(len(dataset), maximum_samples, seed)
+    if len(selected_indices) < batch_size:
+        raise ValueError("the selected training subset must contain at least one full batch")
+
+    output_directory = Path(output_directory)
+    output_directory.mkdir(parents=True, exist_ok=True)
+    history_path = output_directory / "training_history.json"
+    metadata_path = output_directory / "metadata.json"
+    progress_path = output_directory / "progress.json"
+
+    checkpoint_path = None
+    latest_checkpoint_path = None
+    if save_checkpoint:
+        if checkpoint_directory is None:
+            checkpoint_directory = output_directory
+        checkpoint_directory = Path(checkpoint_directory)
+        checkpoint_directory.mkdir(parents=True, exist_ok=True)
+        checkpoint_path = checkpoint_directory / "checkpoint.pt"
+        latest_checkpoint_path = checkpoint_directory / "checkpoint_latest.pt"
+
+    if uses_cuda:
+        torch.cuda.reset_peak_memory_stats(torch_device)
+    model.to(torch_device)
+    subset = Subset(dataset, selected_indices)
+    # BatchNorm cannot train on a one-sample batch. Keep every other partial
+    # final batch so a "full dataset" run really does see every selected pixel.
+    drop_last = len(subset) % batch_size == 1
+    loader_generator = torch.Generator().manual_seed(seed)
+    poisson_generator = None
+    if poisson_effective_count is not None:
+        poisson_generator = torch.Generator(device=torch_device).manual_seed(
+            seed + 1_000_003
+        )
+    centre_mask_generator = None
+    if centre_masking:
+        centre_mask_generator = torch.Generator().manual_seed(int(centre_mask_seed))
+    loader = DataLoader(
+        subset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=drop_last,
+        num_workers=0,
+        generator=loader_generator,
+    )
+    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+
+    resume_signature = {
+        "data_source": str(getattr(dataset, "path", "unspecified")),
+        "dataset_size": len(dataset),
+        "selected_indices": selected_indices,
+        "model_configuration": model.configuration(),
+        "target_epochs": epochs,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "beta": beta,
+        "spatial_lambda": spatial_lambda,
+        "spatial_loss_scale": spatial_loss_scale,
+        "seed": seed,
+    }
+    # Keep the historical signature byte-for-byte compatible for runs without
+    # augmentation, while making augmented checkpoints scale-specific.
+    if getattr(dataset, "window_size", 3) != 3:
+        resume_signature["dataset_window_size"] = dataset.window_size
+    if getattr(dataset, "context_mode", "measured") == "shuffled":
+        resume_signature["context_mode"] = "shuffled"
+        resume_signature["context_seed"] = dataset.context_seed
+        resume_signature["context_permutation_sha256"] = dataset.context_permutation_sha256
+    if poisson_effective_count is not None:
+        resume_signature["poisson_effective_count"] = float(
+            poisson_effective_count
+        )
+    if centre_masking:
+        resume_signature["centre_mask_probability"] = float(centre_mask_probability)
+        resume_signature["centre_mask_seed"] = int(centre_mask_seed)
+    history = []
+    start_epoch = 1
+    resumed_from_epoch = 0
+    previous_peak_allocated = 0
+    previous_peak_reserved = 0
+    if resume_checkpoint is not None:
+        resume_checkpoint = Path(resume_checkpoint)
+        checkpoint = torch.load(resume_checkpoint, map_location="cpu")
+        if checkpoint.get("resume_signature") != resume_signature:
+            raise ValueError(
+                "checkpoint configuration does not match this training run"
+            )
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        _optimizer_to(optimizer, torch_device)
+        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        loader_generator.set_state(checkpoint["loader_generator_state"].cpu())
+        if poisson_generator is not None:
+            poisson_generator.set_state(
+                checkpoint["poisson_generator_state"].cpu()
+            )
+        if centre_mask_generator is not None:
+            centre_mask_generator.set_state(
+                checkpoint["centre_mask_generator_state"].cpu()
+            )
+        history = checkpoint["history"]
+        resumed_from_epoch = int(checkpoint["completed_epochs"])
+        start_epoch = resumed_from_epoch + 1
+        previous_peak_allocated = int(
+            checkpoint.get("peak_gpu_memory_allocated_bytes") or 0
+        )
+        previous_peak_reserved = int(
+            checkpoint.get("peak_gpu_memory_reserved_bytes") or 0
+        )
+        _restore_random_state(checkpoint["random_state"], uses_cuda)
+        print(
+            json.dumps(
+                {
+                    "resumed_from": str(resume_checkpoint),
+                    "completed_epochs": resumed_from_epoch,
+                    "next_epoch": start_epoch,
+                }
+            ),
+            flush=True,
+        )
+    if start_epoch > epochs:
+        raise ValueError("checkpoint has already completed the requested epochs")
+
+    def checkpoint_payload(completed_epochs, training_configuration):
+        peak_allocated = previous_peak_allocated
+        peak_reserved = previous_peak_reserved
+        if uses_cuda:
+            peak_allocated = max(
+                peak_allocated, int(torch.cuda.max_memory_allocated(torch_device))
+            )
+            peak_reserved = max(
+                peak_reserved, int(torch.cuda.max_memory_reserved(torch_device))
+            )
+        payload = {
+            "model_state_dict": model.state_dict(),
+            "optimizer_state_dict": optimizer.state_dict(),
+            "scheduler_state_dict": scheduler.state_dict(),
+            "model_configuration": model.configuration(),
+            "training_configuration": training_configuration,
+            "resume_signature": resume_signature,
+            "completed_epochs": completed_epochs,
+            "history": history,
+            "loader_generator_state": loader_generator.get_state(),
+            "random_state": _capture_random_state(uses_cuda),
+            "peak_gpu_memory_allocated_bytes": peak_allocated or None,
+            "peak_gpu_memory_reserved_bytes": peak_reserved or None,
+        }
+        if poisson_generator is not None:
+            payload["poisson_generator_state"] = poisson_generator.get_state()
+        if centre_mask_generator is not None:
+            payload["centre_mask_generator_state"] = centre_mask_generator.get_state()
+        return payload
+
+    session_start = time.perf_counter()
+    for epoch in range(start_epoch, epochs + 1):
+        if uses_cuda:
+            torch.cuda.synchronize(torch_device)
+        epoch_start = time.perf_counter()
+        model.train()
+        totals = {
+            "total": 0.0,
+            "vae": 0.0,
+            "reconstruction": 0.0,
+            "kl": 0.0,
+            "spatial": 0.0,
+            "spatial_pairs": 0,
+            "poisson_central_l1": 0.0,
+            "poisson_central_cosine": 0.0,
+            "samples": 0,
+            "centre_masked": 0,
+        }
+        for batch in loader:
+            target = batch["target"].to(torch_device, dtype=torch.float32)
+            if poisson_effective_count is None:
+                central_input = target
+            else:
+                central_input = poisson_augment_tic_normalized(
+                    target, poisson_effective_count, generator=poisson_generator
+                )
+            if centre_mask_generator is not None:
+                central_input, centre_masked = apply_centre_mask(
+                    target, centre_mask_probability, centre_mask_generator
+                )
+                totals["centre_masked"] += int(centre_masked.sum())
+
+            optimizer.zero_grad(set_to_none=True)
+            if getattr(model, "uses_neighbourhood_batch", False):
+                neighbours = batch["neighbours"].to(
+                    torch_device, dtype=torch.float32
+                )
+                neighbour_mask = batch["neighbour_mask"].to(
+                    torch_device, dtype=torch.bool
+                )
+                if poisson_effective_count is not None:
+                    neighbours = poisson_augment_tic_normalized(
+                        neighbours,
+                        poisson_effective_count,
+                        generator=poisson_generator,
+                    )
+                model_outputs = model(
+                    central_input, neighbours, neighbour_mask
+                )
+            else:
+                contextual = batch["input"].to(
+                    torch_device, dtype=torch.float32
+                )
+                if poisson_effective_count is not None:
+                    raise ValueError(
+                        "Poisson augmentation requires a model using the "
+                        "separate neighbourhood batch interface"
+                    )
+                model_outputs = model(contextual)
+            reconstruction, mean, log_variance = model_outputs[:3]
+            vae_loss, reconstruction_loss, kl_loss = msipl_vae_loss(
+                reconstruction, target, mean, log_variance, beta=beta
+            )
+            if "x" in batch and "y" in batch:
+                spatial_loss, spatial_pairs = latent_spatial_coherence_loss(
+                    mean, batch["x"], batch["y"]
+                )
+            else:
+                if spatial_lambda > 0:
+                    raise KeyError(
+                        "spatial loss requires x and y coordinates in each batch"
+                    )
+                spatial_loss = mean.sum() * 0.0
+                spatial_pairs = 0
+            weighted_spatial_loss = (
+                float(spatial_lambda) * float(spatial_loss_scale) * spatial_loss
+            )
+            total_loss = vae_loss + weighted_spatial_loss
+            total_loss.backward()
+            optimizer.step()
+
+            sample_count = target.shape[0]
+            totals["total"] += float(total_loss.detach()) * sample_count
+            totals["vae"] += float(vae_loss.detach()) * sample_count
+            totals["reconstruction"] += float(reconstruction_loss.detach()) * sample_count
+            totals["kl"] += float(kl_loss.detach()) * sample_count
+            totals["spatial"] += float(spatial_loss.detach()) * sample_count
+            totals["spatial_pairs"] += spatial_pairs
+            if poisson_effective_count is None:
+                central_l1 = 0.0
+                central_cosine = 1.0
+            else:
+                central_l1 = float(
+                    (central_input - target).abs().sum(dim=1).mean().detach()
+                )
+                central_cosine = float(
+                    functional.cosine_similarity(
+                        central_input, target, dim=1, eps=1e-12
+                    ).mean().detach()
+                )
+            totals["poisson_central_l1"] += central_l1 * sample_count
+            totals["poisson_central_cosine"] += central_cosine * sample_count
+            totals["samples"] += sample_count
+
+        if uses_cuda:
+            torch.cuda.synchronize(torch_device)
+        epoch_seconds = time.perf_counter() - epoch_start
+        record = {
+            "epoch": epoch,
+            "learning_rate": float(optimizer.param_groups[0]["lr"]),
+            "total_loss": totals["total"] / totals["samples"],
+            "vae_loss": totals["vae"] / totals["samples"],
+            "reconstruction_loss": totals["reconstruction"] / totals["samples"],
+            "kl_loss": totals["kl"] / totals["samples"],
+            "spatial_loss": (
+                totals["spatial"] / totals["samples"]
+            ),
+            "weighted_spatial_loss": (
+                float(spatial_lambda)
+                * float(spatial_loss_scale)
+                * totals["spatial"]
+                / totals["samples"]
+            ),
+            "spatial_loss_scale": float(spatial_loss_scale),
+            "spatial_pairs": totals["spatial_pairs"],
+            "poisson_effective_count": (
+                float(poisson_effective_count)
+                if poisson_effective_count is not None
+                else None
+            ),
+            "poisson_central_l1": (
+                totals["poisson_central_l1"] / totals["samples"]
+            ),
+            "poisson_central_cosine": (
+                totals["poisson_central_cosine"] / totals["samples"]
+            ),
+            "samples_seen": totals["samples"],
+            "epoch_seconds": epoch_seconds,
+            "samples_per_second": totals["samples"] / epoch_seconds,
+        }
+        if centre_masking:
+            record["centre_masked_samples"] = totals["centre_masked"]
+            record["centre_masked_fraction"] = totals["centre_masked"] / totals["samples"]
+        history.append(record)
+        print(json.dumps(record), flush=True)
+        scheduler.step()
+
+        _atomic_json_write(history_path, history)
+        progress = {
+            "status": "in_progress" if epoch < epochs else "finalizing",
+            "completed_epochs": epoch,
+            "target_epochs": epochs,
+            "last_epoch": record,
+            "resume_checkpoint": (
+                str(latest_checkpoint_path) if latest_checkpoint_path else None
+            ),
+        }
+        _atomic_json_write(progress_path, progress)
+        if epoch in snapshot_epochs:
+            snapshot_path = checkpoint_directory / f"snapshot_epoch{epoch:03d}.pt"
+            _atomic_torch_save(checkpoint_payload(epoch, progress), snapshot_path)
+            print(json.dumps({"saved_snapshot": str(snapshot_path),
+                              "completed_epochs": epoch}), flush=True)
+        if (
+            save_checkpoint
+            and checkpoint_interval > 0
+            and epoch < epochs
+            and epoch % checkpoint_interval == 0
+        ):
+            _atomic_torch_save(
+                checkpoint_payload(epoch, progress), latest_checkpoint_path
+            )
+            print(
+                json.dumps(
+                    {
+                        "saved_resume_checkpoint": str(latest_checkpoint_path),
+                        "completed_epochs": epoch,
+                    }
+                ),
+                flush=True,
+            )
+
+    session_training_seconds = time.perf_counter() - session_start
+    training_seconds = sum(record["epoch_seconds"] for record in history)
+    peak_gpu_memory_allocated = None
+    peak_gpu_memory_reserved = None
+    device_name = "CPU"
+    if uses_cuda:
+        peak_gpu_memory_allocated = max(
+            previous_peak_allocated,
+            int(torch.cuda.max_memory_allocated(torch_device)),
+        )
+        peak_gpu_memory_reserved = max(
+            previous_peak_reserved,
+            int(torch.cuda.max_memory_reserved(torch_device)),
+        )
+        device_name = torch.cuda.get_device_name(torch_device)
+
+    parameter_count = sum(parameter.numel() for parameter in model.parameters())
+    metadata = {
+        "model": model.__class__.__name__,
+        "data_source": str(getattr(dataset, "path", "unspecified")),
+        "model_configuration": model.configuration(),
+        "parameter_count": parameter_count,
+        "loss": (
+            "msiPL categorical cross-entropy + beta * KL divergence "
+            "+ spatial_lambda * adjacent latent-mean MSE"
+        ),
+        "decoder_target": "isolated TIC-normalized central spectrum",
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "learning_rate": learning_rate,
+        "scheduler": "cosine annealing",
+        "beta": beta,
+        "spatial_lambda": spatial_lambda,
+        "spatial_loss_scale": spatial_loss_scale,
+        "poisson_augmentation": poisson_effective_count is not None,
+        "poisson_effective_count": (
+            float(poisson_effective_count)
+            if poisson_effective_count is not None
+            else None
+        ),
+        "poisson_rule": (
+            "training inputs only: Poisson(TIC-normalized spectrum * "
+            "effective_count), then TIC renormalize; decoder target stays clean"
+            if poisson_effective_count is not None
+            else None
+        ),
+        "seed": seed,
+        "device": str(torch_device),
+        "device_name": device_name,
+        "dataset_size": len(dataset),
+        "selected_samples": len(selected_indices),
+        "selected_indices": selected_indices,
+        "samples_per_epoch": history[-1]["samples_seen"],
+        "drop_last": drop_last,
+        "training_seconds": training_seconds,
+        "session_training_seconds": session_training_seconds,
+        "overall_samples_per_second": (
+            sum(record["samples_seen"] for record in history) / training_seconds
+        ),
+        "peak_gpu_memory_allocated_bytes": peak_gpu_memory_allocated,
+        "peak_gpu_memory_reserved_bytes": peak_gpu_memory_reserved,
+        "checkpoint_saved": bool(save_checkpoint),
+        "checkpoint_interval_epochs": checkpoint_interval,
+        "checkpoint": str(checkpoint_path) if checkpoint_path is not None else None,
+        "resumed_from_checkpoint": (
+            str(resume_checkpoint) if resume_checkpoint is not None else None
+        ),
+        "resumed_from_epoch": resumed_from_epoch,
+        "experiment": experiment_metadata or {},
+        "status": "complete",
+    }
+    if centre_masking:
+        metadata["centre_masking"] = {
+            "probability": float(centre_mask_probability),
+            "seed": int(centre_mask_seed),
+            "rule": (
+                "training only: per sample, with this probability, the centre "
+                "spectrum given to the model (encoder input and attention query) "
+                "is replaced by zeros; neighbours unchanged; the decoder target "
+                "is always the unmasked centre"
+            ),
+            "masked_samples_total": sum(r["centre_masked_samples"] for r in history),
+        }
+    if save_checkpoint:
+        _atomic_torch_save(
+            checkpoint_payload(epochs, metadata), checkpoint_path
+        )
+        if latest_checkpoint_path.exists():
+            latest_checkpoint_path.unlink()
+    _atomic_json_write(history_path, history)
+    _atomic_json_write(metadata_path, metadata)
+    _atomic_json_write(
+        progress_path,
+        {
+            "status": "complete",
+            "completed_epochs": epochs,
+            "target_epochs": epochs,
+            "checkpoint": str(checkpoint_path) if checkpoint_path else None,
+        },
+    )
+    return metadata, history

@@ -1,0 +1,1146 @@
+--- a/s3pl/config.json
++++ b/baselines/s3pl/config.json
+@@ -1,5 +1,6 @@
+ {   
+     "data_dir": "/data/cac/40TopL.imzML",
++    "artifact_root": null,
+     "number_classes": 3,
+     "evaluate_peak_picking": true,
+     "number_peaks": null,
+@@ -11,5 +12,6 @@
+     "batch_size": 16,
+     "learning_rate": 1e-2,
+     "dropout": 0,
+-    "random_seed": 1
++    "random_seed": 1,
++    "normalization": "reference_spatial_max"
+ }
+--- a/s3pl/main.py
++++ b/baselines/s3pl/main.py
+@@ -1,7 +1,9 @@
++# Modified from S3PL v1.0.0 (https://github.com/CeMOS-IS/S3PL, commit 660e3d9) for Spatial-msiPL,
++# October 2026. Licensed under AGPL-3.0 (baselines/s3pl/LICENSE); changes are listed
++# in baselines/s3pl/CHANGES.md and changes_from_660e3d9.diff.
+ import os
+ import json
+ import argparse
+-from train import train
+ 
+ def load_config(config_path, args):
+     with open(config_path, "r") as f:
+@@ -9,6 +11,7 @@
+ 
+     # Override config values if provided via CLI
+     if args.data_dir is not None: config["data_dir"] = args.data_dir
++    if args.artifact_root is not None: config["artifact_root"] = args.artifact_root
+     if args.number_classes is not None: config["number_classes"] = args.number_classes
+     if args.eval_picking is not None: config["evaluate_peak_picking"] = args.eval_picking
+     if args.number_peaks is not None: config["number_peaks"] = args.number_peaks
+@@ -21,6 +24,11 @@
+     if args.learning_rate is not None: config["learning_rate"] = args.learning_rate
+     if args.dropout is not None: config["dropout"] = args.dropout
+     if args.random_seed is not None: config["random_seed"] = args.random_seed
++    if args.initialization_seed is not None: config["initialization_seed"] = args.initialization_seed
++    if args.sample_order_seed is not None: config["sample_order_seed"] = args.sample_order_seed
++    if args.normalization is not None: config["normalization"] = args.normalization
++    if args.input_context_mode is not None: config["input_context_mode"] = args.input_context_mode
++    if args.checkpoint_epochs is not None: config["checkpoint_epochs"] = args.checkpoint_epochs
+ 
+     return config
+ 
+@@ -28,21 +36,45 @@
+     directory_name = os.path.dirname(__file__)
+ 
+     parser = argparse.ArgumentParser("S3PL training, peak picking and evaluation.")
+-    parser.add_argument("--data_dir", type=str, default="")
++    parser.add_argument("--data_dir", type=str, default=None)
++    parser.add_argument("--artifact_root", type=str, default=None)
+     parser.add_argument("--number_classes", type=int, default=None, help="number of annotated classes in the segmentation mask (including background)")
+-    parser.add_argument("--eval_picking", type=bool, default=True, help="whether picked peaks should be evaluated (segmentation is required)")
++    parser.add_argument("--eval_picking", action=argparse.BooleanOptionalAction, default=None, help="whether picked peaks should be evaluated (segmentation is required)")
+     parser.add_argument("--number_peaks", type=int, default=None, required=False)
+-    parser.add_argument("--peaks_per_spectral_patch", type=int, default=512)
+-    parser.add_argument("--spectral_patch_size", type=int, default=3)
+-    parser.add_argument("--kernel_depth_d1", type=int, default=51)
+-    parser.add_argument("--kernel_depth_d2", type=int, default=1)
+-    parser.add_argument("--n_epochs", type=int, default=10)
+-    parser.add_argument("--batch_size", type=int, default=16)
+-    parser.add_argument("--learning_rate", type=float, default=1e-2)
+-    parser.add_argument("--dropout", type=float, default=0)
+-    parser.add_argument("--random_seed", type=int, default=1)
++    parser.add_argument("--peaks_per_spectral_patch", type=int, default=None)
++    parser.add_argument("--spectral_patch_size", type=int, default=None)
++    parser.add_argument("--kernel_depth_d1", type=int, default=None)
++    parser.add_argument("--kernel_depth_d2", type=int, default=None)
++    parser.add_argument("--n_epochs", type=int, default=None)
++    parser.add_argument("--batch_size", type=int, default=None)
++    parser.add_argument("--learning_rate", type=float, default=None)
++    parser.add_argument("--dropout", type=float, default=None)
++    parser.add_argument("--random_seed", type=int, default=None)
++    parser.add_argument("--initialization_seed", type=int, default=None, help="diagnostic only: seed for model initial weights")
++    parser.add_argument("--sample_order_seed", type=int, default=None, help="diagnostic only: seed for training-example order")
++    parser.add_argument(
++        "--normalization",
++        choices=("reference_spatial_max", "paper_tic"),
++        default=None,
++    )
++    parser.add_argument(
++        "--input-context-mode",
++        choices=("none", "tile_centre", "shuffle_nonlocal"),
++        default=None,
++        help="training control: tile_centre replaces neighbour spectra with the normalised centre while keeping the real reconstruction target; shuffle_nonlocal (Test N) replaces them with nonlocal measured pixels at training and inference, and the target is that input patch",
++    )
++
++    parser.add_argument(
++        "--checkpoint_epochs",
++        type=int,
++        nargs="+",
++        default=None,
++        help="logging only: save state-dict copies at these epochs and record per-epoch loss, time and memory",
++    )
+ 
+     args = parser.parse_args()
+     config = load_config(config_path=f'{directory_name}/config.json', args=args)
+ 
+-    mSCF1 = train(config)+    from train import train
++
++    mSCF1 = train(config)
+--- a/s3pl/test.py
++++ b/baselines/s3pl/test.py
+@@ -1,3 +1,6 @@
++# Modified from S3PL v1.0.0 (https://github.com/CeMOS-IS/S3PL, commit 660e3d9) for Spatial-msiPL,
++# October 2026. Licensed under AGPL-3.0 (baselines/s3pl/LICENSE); changes are listed
++# in baselines/s3pl/CHANGES.md and changes_from_660e3d9.diff.
+ import os
+ import numpy as np
+ import pandas as pd
+@@ -7,26 +10,80 @@
+ from torch.utils.data import DataLoader, SubsetRandomSampler
+ from torchvision import transforms
+ import tqdm
+-import m2aia as m2
+ 
+ from utils.PeakEvaluation import PeakEvaluation, PeakEvaluationMultipleClasses
+-from utils.helpers import tic_norm_spectra, check_for_labels
++from utils.data_source import build_patch_dataset
++from utils.helpers import (
++    artifact_directories,
++    check_for_labels,
++    normalize_spectra,
++    resolve_data_paths,
++)
+ from model.Attention3DConvAutoencoder import Attention3DConvAutoencoder
+ import data_configs
+ 
+-def test(config, test_indices):
++
++def ablate_patch_context(batch, mode):
++    """Change only noncentral patch positions after the saved normalisation."""
++    if mode == "none":
++        return batch
++    if mode not in ("zero_noncentral", "tile_centre", "rotate_90", "permute_within_rings"):
++        raise ValueError(f"Unknown frozen input ablation: {mode}")
++    if batch.ndim != 5 or batch.shape[-1] != batch.shape[-2] or batch.shape[-1] % 2 != 1:
++        raise ValueError("S3PL batch must have shape (batch, channel, mz, odd_y, odd_x)")
++    centre = batch.shape[-1] // 2
++    if mode == "rotate_90":
++        return torch.rot90(batch, 1, dims=(-2, -1))
++    if mode == "permute_within_rings":
++        permuted = batch.clone()
++        for radius in range(1, centre + 1):
++            ring = [
++                (row, column)
++                for row in range(centre - radius, centre + radius + 1)
++                for column in range(centre - radius, centre + radius + 1)
++                if max(abs(row - centre), abs(column - centre)) == radius
++            ]
++            rows, columns = zip(*ring)
++            source_rows, source_columns = zip(*(ring[1:] + ring[:1]))
++            permuted[..., rows, columns] = batch[..., source_rows, source_columns]
++        return permuted
++    if mode == "tile_centre":
++        return batch[..., centre : centre + 1, centre : centre + 1].expand_as(batch).clone()
++    ablated = torch.zeros_like(batch)
++    ablated[..., centre, centre] = batch[..., centre, centre]
++    return ablated
++
++def test(
++    config,
++    test_indices,
++    number_peaks_override=None,
++    result_suffix="",
++    input_ablation="none",
++):
++    if input_ablation not in ("none", "zero_noncentral", "tile_centre", "rotate_90", "permute_within_rings"):
++        raise ValueError(f"Unknown frozen input ablation: {input_ablation}")
+     training_name = config["training_name"]
+-    model_path = 'weights/' + training_name + '.pt'
+-    config_path = 'logs/' + training_name + '.json'
++    directory_name = os.path.dirname(__file__)
++    artifact_dirs = artifact_directories(config, directory_name)
++    model_path = artifact_dirs["weights"] / (training_name + '.pt')
++    config_path = artifact_dirs["logs"] / (training_name + '.json')
+ 
+     with open(config_path) as f:
+         config = json.load(f)
++    training_context_mode = config.get("input_context_mode", "none")
++    if training_context_mode not in ("none", "tile_centre", "shuffle_nonlocal"):
++        raise ValueError(f"Unsupported training input context: {training_context_mode}")
++    if training_context_mode != "none" and input_ablation != "none":
++        raise ValueError("Do not combine a trained input control with a frozen input intervention")
++    effective_input_mode = training_context_mode if input_ablation == "none" else input_ablation
++
++    if number_peaks_override is not None:
++        if number_peaks_override < 1:
++            raise ValueError("number_peaks_override must be positive")
++        config["number_peaks"] = int(number_peaks_override)
+ 
+     data_dir = config["data_dir"]
+-    dataname = data_dir.split('/')[-1].replace('.imzML', '').replace('.h5', '').replace('.npy', '')
+-    directory_name = os.path.dirname(__file__)
+-    folderpath = directory_name + data_dir.split(dataname + '.imzML')[0]
+-    filepath = directory_name + data_dir
++    filepath, folderpath, dataname = resolve_data_paths(data_dir, directory_name)
+ 
+     spectral_patch_size = config["spectral_patch_size"]
+ 
+@@ -40,18 +97,46 @@
+     else:
+         number_classes = data_configs.number_classes[dataname]
+ 
+-    I = m2.ImzMLReader(filepath)
+-    mz_list = torch.tensor(I.GetXAxis())
+-    image_handles=[I]
+-
+-    transform = transforms.Lambda(lambda x: torch.tensor(tic_norm_spectra(x), dtype=torch.float32))
+-    
+-    test_dataset = m2.SpectrumDataset(image_handles, shape=(config["spectral_patch_size"], config["spectral_patch_size"]), buffer_type="memory", transform_data=transform)
+-    test_sampler = SubsetRandomSampler(test_indices)
+-    test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False, drop_last=False, sampler=test_sampler)
++    normalization = config.get("normalization", "reference_spatial_max")
++    transform = transforms.Lambda(
++        lambda x: torch.tensor(
++            normalize_spectra(x, normalization), dtype=torch.float32
++        )
++    )
++    if training_context_mode == "shuffle_nonlocal":
++        # Test N: inference sees the same shuffled patches as training.
++        test_dataset, mz_values = build_patch_dataset(
++            filepath,
++            config["spectral_patch_size"],
++            transform,
++            neighbour_shuffle_seed=config["neighbour_shuffle_seed"],
++        )
++    else:
++        test_dataset, mz_values = build_patch_dataset(
++            filepath,
++            config["spectral_patch_size"],
++            transform,
++        )
++    mz_list = torch.tensor(mz_values)
++    if test_indices is None:
++        test_loader = DataLoader(
++            test_dataset,
++            batch_size=1,
++            shuffle=False,
++            drop_last=False,
++        )
++    else:
++        test_sampler = SubsetRandomSampler(test_indices)
++        test_loader = DataLoader(
++            test_dataset,
++            batch_size=1,
++            shuffle=False,
++            drop_last=False,
++            sampler=test_sampler,
++        )
+ 
+     model = Attention3DConvAutoencoder(batchsize=1, kernel_depth_d1=config["kernel_depth_d1"], kernel_depth_d2=config["kernel_depth_d2"], dropout=config["dropout"], spectral_patch_size=config["spectral_patch_size"])
+-    model.load_state_dict(torch.load(model_path, map_location=torch.device('cpu')), strict=False)    
++    model.load_state_dict(torch.load(str(model_path), map_location=torch.device('cpu')), strict=False)
+     model.eval()
+ 
+     use_cuda = torch.cuda.is_available()
+@@ -60,6 +145,10 @@
+         mz_list = mz_list.cuda()
+ 
+     peak_selection = {}
++    controlled_seed_diagnostic = (
++        config.get("initialization_seed") is not None
++        and config.get("sample_order_seed") is not None
++    )
+     with tqdm.tqdm(test_loader, unit="batch") as bar:
+         for batch in bar:
+             bar.set_description(f"Test")
+@@ -71,6 +160,9 @@
+                 X_batch = X_batch.cuda()
+                 y_batch = y_batch.cuda()
+ 
++            if effective_input_mode != "shuffle_nonlocal":  # already in the patch
++                X_batch = ablate_patch_context(X_batch, effective_input_mode)
++
+             y_pred, binary_mask, attention_mask = model(X_batch)
+ 
+             attention_mask = attention_mask.squeeze()
+@@ -94,20 +186,45 @@
+     print('length of peak selection before cut-off = ' + str(len(sorted_peak_list)))
+     peak_list = sorted_peak_list[:number_peaks]
+ 
+-    resultfolder = 'results/' + training_name + '/'
+-    filename_peak_evaluation = resultfolder + 'peak_evaluation_' + dataname + '_' + str(config["n_epochs"]) + 'epochs.txt'
+-
+-    if not os.path.exists('results'): os.mkdir('results')
+-    if not os.path.exists(resultfolder): os.mkdir(resultfolder)
++    resultfolder = artifact_dirs["results"] / (training_name + result_suffix)
++    filename_peak_evaluation = resultfolder / ('peak_evaluation_' + dataname + '_' + str(config["n_epochs"]) + 'epochs.txt')
++
++    resultfolder.mkdir(parents=True, exist_ok=True)
+ 
+     df = pd.DataFrame(peak_list)
+-    df.to_csv(resultfolder + 'picked_peaks_' + dataname + '_' + str(peaks_per_spectral_patch) + 'peaks_z_patchsize_' + str(spectral_patch_size) + '.csv', index=False)
++    df.to_csv(resultfolder / ('picked_peaks_' + dataname + '_' + str(peaks_per_spectral_patch) + 'peaks_z_patchsize_' + str(spectral_patch_size) + '.csv'), index=False)
++    if controlled_seed_diagnostic:
++        # Preserve the released peak ranking; expose the votes that produced it.
++        pd.DataFrame(
++            {
++                "rank": range(1, len(sorted_peak_list) + 1),
++                "mz": sorted_peak_list,
++                "pixel_topk_votes": [peak_selection[mz] for mz in sorted_peak_list],
++                "selected": [rank < number_peaks for rank in range(len(sorted_peak_list))],
++            }
++        ).to_csv(resultfolder / "peak_vote_diagnostics.csv", index=False)
+ 
+     mSCF1 = None
+     if config["evaluate_peak_picking"]:
+-        check_for_labels(folderpath, dataname)
+-
+-        with open(filename_peak_evaluation, 'a') as file:
++        check_for_labels(folderpath, dataname, filepath)
++        evaluation_metrics = {
++            "dataset": dataname,
++            "normalization": normalization,
++            "number_picked_peaks": len(peak_list),
++            "peak_count_source": (
++                "explicit_matched_override"
++                if number_peaks_override is not None
++                else "training_configuration_or_data_default"
++            ),
++            "source_training_name": training_name,
++            "frozen_input_ablation": input_ablation,
++            "training_input_context_mode": training_context_mode,
++            "effective_input_context_mode": effective_input_mode,
++            "class_metrics": {},
++            "mixed_f1": {},
++        }
++
++        with open(filename_peak_evaluation, 'w') as file:
+             file.write(training_name + ':\n')
+             file.write('number picked peaks = ' + str(len(peak_list)) + ', Recall/Precision/F1-Score/Correlation-Score\n')
+ 
+@@ -115,8 +232,9 @@
+         print('number picked peaks = ' + str(len(peak_list)))
+ 
+         for pcc_threshold in [0.3, 0.4, 0.5, 0.6]:
+-            evaluate_peaks = PeakEvaluationMultipleClasses(dataname, list(range(number_classes)), pcc_threshold, folderpath, peak_list, show_ion_images=False)
++            evaluate_peaks = PeakEvaluationMultipleClasses(dataname, list(range(number_classes)), pcc_threshold, folderpath, peak_list, show_ion_images=False, mz_values=mz_values)
+             class_metrics = evaluate_peaks.calculate_metrics()
++            evaluation_metrics["class_metrics"][str(pcc_threshold)] = class_metrics
+ 
+             with open(filename_peak_evaluation, 'a') as file:
+                 file.write('T_PCC = ' + str(pcc_threshold) + '\n')
+@@ -134,18 +252,23 @@
+ 
+         F1_scores_mixed = []
+         for pcc_threshold in [0.3, 0.4, 0.5, 0.6]:      
+-            evaluate_peaks = PeakEvaluation(dataname, list(range(number_classes)), pcc_threshold, folderpath, peak_list, show_ion_images=False)
++            evaluate_peaks = PeakEvaluation(dataname, list(range(number_classes)), pcc_threshold, folderpath, peak_list, show_ion_images=False, mz_values=mz_values)
+             recall, precision, F1 = evaluate_peaks.calculate_metrics()
+ 
+             F1_scores_mixed.append(F1)
++            evaluation_metrics["mixed_f1"][str(pcc_threshold)] = F1
+             with open(filename_peak_evaluation, 'a') as file:
+                 file.write('F1 ' + str(pcc_threshold) + ' = ')
+                 file.write(str(round(F1,3)) + '\n')
+             print('F1 ' + str(pcc_threshold) + ' = ' + str(round(F1,3)) + '\n')
+ 
+-        mSCF1 = round(np.mean(F1_scores_mixed),3)
++        mSCF1 = float(round(np.mean(F1_scores_mixed),3))
++        evaluation_metrics["mSCF1"] = mSCF1
+         with open(filename_peak_evaluation, 'a') as file:
+             file.write('mSCF1 = ' + str(mSCF1) + '\n')
+         print('mSCF1 = ' + str(mSCF1) + '\n')
++
++        with open(resultfolder / 'metrics.json', 'w') as file:
++            json.dump(evaluation_metrics, file, indent=4)
+     
+-    return mSCF1+    return mSCF1
+--- a/s3pl/tests/fixtures/pre_seed_flags/train.py
++++ b/baselines/s3pl/tests/fixtures/pre_seed_flags/train.py
+@@ -1,6 +1,14 @@
++# Modified from S3PL v1.0.0 (https://github.com/CeMOS-IS/S3PL, commit 660e3d9) for Spatial-msiPL,
++# October 2026. Licensed under AGPL-3.0 (baselines/s3pl/LICENSE); changes are listed
++# in baselines/s3pl/CHANGES.md and changes_from_660e3d9.diff.
+ import os
+ import random
+ import json
++import time
++try:
++    import resource  # peak host RSS (Linux); absent on Windows
++except ImportError:
++    resource = None
+ import numpy as np
+ 
+ import torch
+@@ -9,33 +17,59 @@
+ from torch.utils.data import DataLoader, SubsetRandomSampler
+ from torchvision import transforms
+ import tqdm
+-import m2aia as m2
+ 
+ from model.Attention3DConvAutoencoder import Attention3DConvAutoencoder
+-from test import test
+-from utils.helpers import tic_norm_spectra
++from test import ablate_patch_context, test
++from utils.data_source import build_patch_dataset
++from utils.nonlocal_shuffle import NONLOCAL_SHUFFLE_SEED
++from utils.helpers import artifact_directories, normalize_spectra, resolve_data_paths
+ 
+ def train(config):   
++    input_context_mode = config.get("input_context_mode", "none")
++    if input_context_mode not in ("none", "tile_centre", "shuffle_nonlocal"):
++        raise ValueError(f"Unsupported training input context: {input_context_mode}")
++    # Test N (protocol 18 Section 6.5): the patches themselves carry shuffled
++    # nonlocal neighbours, and the reconstruction target is that input patch.
++    shuffle_seed = NONLOCAL_SHUFFLE_SEED if input_context_mode == "shuffle_nonlocal" else None
++    if shuffle_seed is not None:
++        config["neighbour_shuffle_seed"] = shuffle_seed
++        config["reconstruction_target"] = "input patch (shuffled nonlocal neighbours, real centre)"
+     random_seed = config["random_seed"]
+     random.seed(random_seed)
+     np.random.seed(random_seed)
+     torch.manual_seed(random_seed)
+     torch.cuda.manual_seed(random_seed)
+     use_cuda = torch.cuda.is_available()
++    if use_cuda:
++        torch.cuda.reset_peak_memory_stats()
++
++    total_started_at = time.perf_counter()
+ 
+     data_dir = config["data_dir"]
+-    dataname = data_dir.split('/')[-1].replace('.imzML', '').replace('.npy', '')
+     directory_name = os.path.dirname(__file__)
+-    folderpath = directory_name + data_dir.split(dataname + '.imzML')[0]
+-    filepath = directory_name + data_dir
+-
+-    I = m2.ImzMLReader(filepath)
+-    mz_list = I.GetXAxis()
+-    image_handles=[I]
++    filepath, folderpath, dataname = resolve_data_paths(data_dir, directory_name)
++    artifact_dirs = artifact_directories(config, directory_name)
++
++    normalization = config.get("normalization", "reference_spatial_max")
++    transform = transforms.Lambda(
++        lambda x: torch.tensor(
++            normalize_spectra(x, normalization), dtype=torch.float32
++        )
++    )
++    if shuffle_seed is None:
++        training_dataset, mz_list = build_patch_dataset(
++            filepath,
++            config["spectral_patch_size"],
++            transform,
++        )
++    else:
++        training_dataset, mz_list = build_patch_dataset(
++            filepath,
++            config["spectral_patch_size"],
++            transform,
++            neighbour_shuffle_seed=shuffle_seed,
++        )
+     num_input_channels = len(mz_list)
+-
+-    transform = transforms.Lambda(lambda x: torch.tensor(tic_norm_spectra(x), dtype=torch.float32))
+-    training_dataset = m2.SpectrumDataset(image_handles, shape=(config["spectral_patch_size"], config["spectral_patch_size"]), buffer_type="memory", transform_data=transform)
+     
+     dataset_size = len(training_dataset)
+     indices = list(range(dataset_size))
+@@ -54,10 +88,19 @@
+     if use_cuda:
+         model = model.cuda()
+ 
+-    if not os.path.exists('weights'): os.mkdir('weights')
+-    if not os.path.exists('logs'): os.mkdir('logs')
++    for path in artifact_dirs.values():
++        path.mkdir(parents=True, exist_ok=True)
+     training_name = dataname + '_' + model._get_name() + '_' + str(config["n_epochs"]) + 'epochs_' + str(config["peaks_per_spectral_patch"]) + '_' + 'spectral_patch_size_' + str(config["spectral_patch_size"])
+-    path_to_weights = 'weights/' + training_name + '.pt'
++    if normalization != "reference_spatial_max":
++        training_name += "_" + normalization
++    if input_context_mode != "none":
++        training_name += "_train_" + input_context_mode
++    path_to_weights = artifact_dirs["weights"] / (training_name + '.pt')
++    if input_context_mode != "none" and (
++        path_to_weights.exists()
++        or (artifact_dirs["logs"] / (training_name + '.json')).exists()
++    ):
++        raise FileExistsError(f"Refusing to overwrite training-control artifacts for {training_name}")
+ 
+     pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+     print(path_to_weights)
+@@ -65,20 +108,35 @@
+     print('input channels = ' + str(num_input_channels))
+     print('trainable parameters: ' + str(pytorch_total_params))
+     print('GPU available: ' + str(use_cuda))
++    print('normalization: ' + normalization)
++    print('input context mode: ' + input_context_mode)
+     
+     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["learning_rate"])
+ 
++    # Item C2 (15 October), opt-in and logging only: state-dict copies at the
++    # listed epochs and per-epoch timing/loss/memory records. Neither draws
++    # random numbers nor changes any computation or the data order.
++    checkpoint_epochs = sorted(set(int(e) for e in config.get("checkpoint_epochs") or []))
++    if any(e < 1 or e > config["n_epochs"] for e in checkpoint_epochs):
++        raise ValueError("checkpoint_epochs must lie within 1..n_epochs")
++    epoch_details = []
++    train_started_at = time.perf_counter()
+     train_history = []
+     for epoch in range(config["n_epochs"]):
+         model.train()
++        epoch_started_at = time.perf_counter()
++        batch_loss_sum = 0.0
++        batch_count = 0
+ 
+         with tqdm.tqdm(training_loader, unit="batch") as bar:
+             for batch in bar:
+                 bar.set_description(f"Epoch {epoch}")
+                 optimizer.zero_grad()
+ 
+-                X_batch, _ = batch            
+-                y_batch = X_batch
++                X_batch, _ = batch
++                y_batch = X_batch  # Keep the original real-patch reconstruction target.
++                if input_context_mode != "shuffle_nonlocal":  # already in the patch
++                    X_batch = ablate_patch_context(X_batch, input_context_mode)
+ 
+                 if use_cuda:
+                     X_batch = X_batch.cuda()
+@@ -90,18 +148,68 @@
+                 loss.backward()
+                 optimizer.step()
+ 
+-                bar.set_postfix_str(str(criterion._get_name()) + '=' + str(loss.item()))
++                batch_loss = loss.item()
++                batch_loss_sum += batch_loss
++                batch_count += 1
++                bar.set_postfix_str(str(criterion._get_name()) + '=' + str(batch_loss))
+ 
+         loss = loss.item()
+         train_history.append(loss)
+-        
+-    torch.save(model.state_dict(), path_to_weights)
++        if checkpoint_epochs:
++            completed = epoch + 1
++            epoch_details.append({
++                "epoch": completed,
++                "last_batch_loss": loss,
++                "epoch_mean_loss": batch_loss_sum / batch_count,
++                "batches": batch_count,
++                "epoch_seconds": time.perf_counter() - epoch_started_at,
++                "peak_gpu_memory_allocated_bytes_so_far": (
++                    int(torch.cuda.max_memory_allocated()) if use_cuda else None),
++                "peak_host_rss_kib_so_far": (
++                    resource.getrusage(resource.RUSAGE_SELF).ru_maxrss if resource else None),
++            })
++            if completed in checkpoint_epochs:
++                torch.save(model.state_dict(),
++                           str(artifact_dirs["weights"] / f"{training_name}_epoch{completed}.pt"))
++
++    training_seconds = time.perf_counter() - train_started_at
++    torch.save(model.state_dict(), str(path_to_weights))
+ 
+     config["training_name"] = training_name
+     config["train_history"] = train_history
+-    
+-    with open('logs/' + training_name + '.json', 'w') as f:
++    if checkpoint_epochs:
++        config["epoch_details"] = epoch_details
++        config["epoch_checkpoints"] = {
++            str(e): f"{training_name}_epoch{e}.pt" for e in checkpoint_epochs}
++
++    with open(artifact_dirs["logs"] / (training_name + '.json'), 'w') as f:
+         json.dump(config, f, indent=4)
+ 
++    evaluation_started_at = time.perf_counter()
+     mSCF1 = test(config, test_indices)
+-    return mSCF1+    evaluation_seconds = time.perf_counter() - evaluation_started_at
++    total_seconds = time.perf_counter() - total_started_at
++
++    runtime_metrics = {
++        "dataset": dataname,
++        "normalization": normalization,
++        "device": torch.cuda.get_device_name(0) if use_cuda else "cpu",
++        "training_seconds": training_seconds,
++        "evaluation_seconds": evaluation_seconds,
++        "total_seconds": total_seconds,
++        "peak_gpu_memory_bytes": (
++            int(torch.cuda.max_memory_allocated()) if use_cuda else None
++        ),
++    }
++    if checkpoint_epochs:
++        runtime_metrics["peak_host_rss_kib"] = (
++            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss if resource else None)
++        runtime_metrics["training_seconds_scope"] = (
++            "training loop only; patch dataset built before the timer; evaluation separate")
++    resultfolder = artifact_dirs["results"] / training_name
++    resultfolder.mkdir(parents=True, exist_ok=True)
++    with open(resultfolder / "runtime_metrics.json", "w") as f:
++        json.dump(runtime_metrics, f, indent=4)
++
++    print("Runtime metrics:", runtime_metrics)
++    return mSCF1
+--- a/s3pl/train.py
++++ b/baselines/s3pl/train.py
+@@ -1,6 +1,14 @@
++# Modified from S3PL v1.0.0 (https://github.com/CeMOS-IS/S3PL, commit 660e3d9) for Spatial-msiPL,
++# October 2026. Licensed under AGPL-3.0 (baselines/s3pl/LICENSE); changes are listed
++# in baselines/s3pl/CHANGES.md and changes_from_660e3d9.diff.
+ import os
+ import random
+ import json
++import time
++try:
++    import resource  # peak host RSS (Linux); absent on Windows
++except ImportError:
++    resource = None
+ import numpy as np
+ 
+ import torch
+@@ -9,55 +17,109 @@
+ from torch.utils.data import DataLoader, SubsetRandomSampler
+ from torchvision import transforms
+ import tqdm
+-import m2aia as m2
+ 
+ from model.Attention3DConvAutoencoder import Attention3DConvAutoencoder
+-from test import test
+-from utils.helpers import tic_norm_spectra
++from test import ablate_patch_context, test
++from utils.data_source import build_patch_dataset
++from utils.nonlocal_shuffle import NONLOCAL_SHUFFLE_SEED
++from utils.helpers import artifact_directories, normalize_spectra, resolve_data_paths
+ 
+ def train(config):   
++    input_context_mode = config.get("input_context_mode", "none")
++    if input_context_mode not in ("none", "tile_centre", "shuffle_nonlocal"):
++        raise ValueError(f"Unsupported training input context: {input_context_mode}")
++    # Test N (protocol 18 Section 6.5): the patches themselves carry shuffled
++    # nonlocal neighbours, and the reconstruction target is that input patch.
++    shuffle_seed = NONLOCAL_SHUFFLE_SEED if input_context_mode == "shuffle_nonlocal" else None
++    if shuffle_seed is not None:
++        config["neighbour_shuffle_seed"] = shuffle_seed
++        config["reconstruction_target"] = "input patch (shuffled nonlocal neighbours, real centre)"
+     random_seed = config["random_seed"]
++    initialization_seed = config.get("initialization_seed")
++    sample_order_seed = config.get("sample_order_seed")
++    if (initialization_seed is None) != (sample_order_seed is None):
++        raise ValueError("Set both initialization_seed and sample_order_seed for a controlled seed experiment")
++    if initialization_seed is not None and (
++        not isinstance(initialization_seed, int)
++        or not isinstance(sample_order_seed, int)
++        or min(initialization_seed, sample_order_seed) < 0
++    ):
++        raise ValueError("Controlled seeds must be nonnegative integers")
+     random.seed(random_seed)
+     np.random.seed(random_seed)
+     torch.manual_seed(random_seed)
+     torch.cuda.manual_seed(random_seed)
+     use_cuda = torch.cuda.is_available()
++    if use_cuda:
++        torch.cuda.reset_peak_memory_stats()
++
++    total_started_at = time.perf_counter()
+ 
+     data_dir = config["data_dir"]
+-    dataname = data_dir.split('/')[-1].replace('.imzML', '').replace('.npy', '')
+     directory_name = os.path.dirname(__file__)
+-    folderpath = directory_name + data_dir.split(dataname + '.imzML')[0]
+-    filepath = directory_name + data_dir
+-
+-    I = m2.ImzMLReader(filepath)
+-    mz_list = I.GetXAxis()
+-    image_handles=[I]
++    filepath, folderpath, dataname = resolve_data_paths(data_dir, directory_name)
++    artifact_dirs = artifact_directories(config, directory_name)
++
++    normalization = config.get("normalization", "reference_spatial_max")
++    transform = transforms.Lambda(
++        lambda x: torch.tensor(
++            normalize_spectra(x, normalization), dtype=torch.float32
++        )
++    )
++    if shuffle_seed is None:
++        training_dataset, mz_list = build_patch_dataset(
++            filepath,
++            config["spectral_patch_size"],
++            transform,
++        )
++    else:
++        training_dataset, mz_list = build_patch_dataset(
++            filepath,
++            config["spectral_patch_size"],
++            transform,
++            neighbour_shuffle_seed=shuffle_seed,
++        )
+     num_input_channels = len(mz_list)
+-
+-    transform = transforms.Lambda(lambda x: torch.tensor(tic_norm_spectra(x), dtype=torch.float32))
+-    training_dataset = m2.SpectrumDataset(image_handles, shape=(config["spectral_patch_size"], config["spectral_patch_size"]), buffer_type="memory", transform_data=transform)
+     
+     dataset_size = len(training_dataset)
+     indices = list(range(dataset_size))
+-    np.random.seed(random_seed)
++    np.random.seed(random_seed if sample_order_seed is None else sample_order_seed)
+     np.random.shuffle(indices)
+ 
+     train_indices = indices
+     test_indices = indices
+ 
+-    train_sampler = SubsetRandomSampler(train_indices)
++    # The released-code path keeps the global RNG behaviour exactly as before.
++    # In a controlled experiment, the sampler has its own stream so changing
++    # model initialisation cannot silently change the mini-batch order.
++    sampler_generator = None
++    if sample_order_seed is not None:
++        sampler_generator = torch.Generator().manual_seed(sample_order_seed)
++    train_sampler = SubsetRandomSampler(train_indices, generator=sampler_generator)
+     training_loader = DataLoader(training_dataset, batch_size=config["batch_size"], shuffle=False, drop_last=True, sampler=train_sampler)
+ 
++    if initialization_seed is not None:
++        torch.manual_seed(initialization_seed)
++        torch.cuda.manual_seed(initialization_seed)
+     model = Attention3DConvAutoencoder(config["batch_size"], kernel_depth_d1=config["kernel_depth_d1"], kernel_depth_d2=config["kernel_depth_d2"], dropout=config["dropout"], spectral_patch_size=config["spectral_patch_size"])
+     criterion = nn.MSELoss()
+ 
+     if use_cuda:
+         model = model.cuda()
+ 
+-    if not os.path.exists('weights'): os.mkdir('weights')
+-    if not os.path.exists('logs'): os.mkdir('logs')
++    for path in artifact_dirs.values():
++        path.mkdir(parents=True, exist_ok=True)
+     training_name = dataname + '_' + model._get_name() + '_' + str(config["n_epochs"]) + 'epochs_' + str(config["peaks_per_spectral_patch"]) + '_' + 'spectral_patch_size_' + str(config["spectral_patch_size"])
+-    path_to_weights = 'weights/' + training_name + '.pt'
++    if normalization != "reference_spatial_max":
++        training_name += "_" + normalization
++    if input_context_mode != "none":
++        training_name += "_train_" + input_context_mode
++    path_to_weights = artifact_dirs["weights"] / (training_name + '.pt')
++    if input_context_mode != "none" and (
++        path_to_weights.exists()
++        or (artifact_dirs["logs"] / (training_name + '.json')).exists()
++    ):
++        raise FileExistsError(f"Refusing to overwrite training-control artifacts for {training_name}")
+ 
+     pytorch_total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+     print(path_to_weights)
+@@ -65,20 +127,38 @@
+     print('input channels = ' + str(num_input_channels))
+     print('trainable parameters: ' + str(pytorch_total_params))
+     print('GPU available: ' + str(use_cuda))
++    print('normalization: ' + normalization)
++    print('input context mode: ' + input_context_mode)
++    if initialization_seed is not None:
++        print('controlled initialization seed: ' + str(initialization_seed))
++        print('controlled sample-order seed: ' + str(sample_order_seed))
+     
+     optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), lr=config["learning_rate"])
+ 
++    # Item C2 (15 October), opt-in and logging only: state-dict copies at the
++    # listed epochs and per-epoch timing/loss/memory records. Neither draws
++    # random numbers nor changes any computation or the data order.
++    checkpoint_epochs = sorted(set(int(e) for e in config.get("checkpoint_epochs") or []))
++    if any(e < 1 or e > config["n_epochs"] for e in checkpoint_epochs):
++        raise ValueError("checkpoint_epochs must lie within 1..n_epochs")
++    epoch_details = []
++    train_started_at = time.perf_counter()
+     train_history = []
+     for epoch in range(config["n_epochs"]):
+         model.train()
++        epoch_started_at = time.perf_counter()
++        batch_loss_sum = 0.0
++        batch_count = 0
+ 
+         with tqdm.tqdm(training_loader, unit="batch") as bar:
+             for batch in bar:
+                 bar.set_description(f"Epoch {epoch}")
+                 optimizer.zero_grad()
+ 
+-                X_batch, _ = batch            
+-                y_batch = X_batch
++                X_batch, _ = batch
++                y_batch = X_batch  # Keep the original real-patch reconstruction target.
++                if input_context_mode != "shuffle_nonlocal":  # already in the patch
++                    X_batch = ablate_patch_context(X_batch, input_context_mode)
+ 
+                 if use_cuda:
+                     X_batch = X_batch.cuda()
+@@ -90,18 +170,68 @@
+                 loss.backward()
+                 optimizer.step()
+ 
+-                bar.set_postfix_str(str(criterion._get_name()) + '=' + str(loss.item()))
++                batch_loss = loss.item()
++                batch_loss_sum += batch_loss
++                batch_count += 1
++                bar.set_postfix_str(str(criterion._get_name()) + '=' + str(batch_loss))
+ 
+         loss = loss.item()
+         train_history.append(loss)
+-        
+-    torch.save(model.state_dict(), path_to_weights)
++        if checkpoint_epochs:
++            completed = epoch + 1
++            epoch_details.append({
++                "epoch": completed,
++                "last_batch_loss": loss,
++                "epoch_mean_loss": batch_loss_sum / batch_count,
++                "batches": batch_count,
++                "epoch_seconds": time.perf_counter() - epoch_started_at,
++                "peak_gpu_memory_allocated_bytes_so_far": (
++                    int(torch.cuda.max_memory_allocated()) if use_cuda else None),
++                "peak_host_rss_kib_so_far": (
++                    resource.getrusage(resource.RUSAGE_SELF).ru_maxrss if resource else None),
++            })
++            if completed in checkpoint_epochs:
++                torch.save(model.state_dict(),
++                           str(artifact_dirs["weights"] / f"{training_name}_epoch{completed}.pt"))
++
++    training_seconds = time.perf_counter() - train_started_at
++    torch.save(model.state_dict(), str(path_to_weights))
+ 
+     config["training_name"] = training_name
+     config["train_history"] = train_history
+-    
+-    with open('logs/' + training_name + '.json', 'w') as f:
++    if checkpoint_epochs:
++        config["epoch_details"] = epoch_details
++        config["epoch_checkpoints"] = {
++            str(e): f"{training_name}_epoch{e}.pt" for e in checkpoint_epochs}
++
++    with open(artifact_dirs["logs"] / (training_name + '.json'), 'w') as f:
+         json.dump(config, f, indent=4)
+ 
++    evaluation_started_at = time.perf_counter()
+     mSCF1 = test(config, test_indices)
+-    return mSCF1+    evaluation_seconds = time.perf_counter() - evaluation_started_at
++    total_seconds = time.perf_counter() - total_started_at
++
++    runtime_metrics = {
++        "dataset": dataname,
++        "normalization": normalization,
++        "device": torch.cuda.get_device_name(0) if use_cuda else "cpu",
++        "training_seconds": training_seconds,
++        "evaluation_seconds": evaluation_seconds,
++        "total_seconds": total_seconds,
++        "peak_gpu_memory_bytes": (
++            int(torch.cuda.max_memory_allocated()) if use_cuda else None
++        ),
++    }
++    if checkpoint_epochs:
++        runtime_metrics["peak_host_rss_kib"] = (
++            resource.getrusage(resource.RUSAGE_SELF).ru_maxrss if resource else None)
++        runtime_metrics["training_seconds_scope"] = (
++            "training loop only; patch dataset built before the timer; evaluation separate")
++    resultfolder = artifact_dirs["results"] / training_name
++    resultfolder.mkdir(parents=True, exist_ok=True)
++    with open(resultfolder / "runtime_metrics.json", "w") as f:
++        json.dump(runtime_metrics, f, indent=4)
++
++    print("Runtime metrics:", runtime_metrics)
++    return mSCF1
+--- a/s3pl/utils/create_pearson_labels.py
++++ b/baselines/s3pl/utils/create_pearson_labels.py
+@@ -1,51 +1,74 @@
+-import os
++# Modified from S3PL v1.0.0 (https://github.com/CeMOS-IS/S3PL, commit 660e3d9) for Spatial-msiPL,
++# October 2026. Licensed under AGPL-3.0 (baselines/s3pl/LICENSE); changes are listed
++# in baselines/s3pl/CHANGES.md and changes_from_660e3d9.diff.
++from pathlib import Path
++
+ import numpy as np
+-from scipy import stats
+-import math
+-import matplotlib.pyplot as plt
+-from pyimzml.ImzMLParser import ImzMLParser
+ 
+-def create_pearson_labels(dataname, folderpath, num_classes):   
+-    if not os.path.exists(folderpath + '/labels'): os.mkdir(folderpath + '/labels')
++from utils.data_source import load_spectrum_table
+ 
+-    segmentation_classes = list(range(0,num_classes))
+-    name_of_labels = (folderpath + 'masks/' + dataname + '_mask.npy').replace('_all_classes', '')
+-    mask_orig = np.load(name_of_labels)
+ 
+-    p = ImzMLParser(folderpath + dataname + '.imzML')
+-    all_mz, _ = p.getspectrum(0)
++def _pearson_by_feature(binary_mask, spectra, chunk_size=2048):
++    """Calculate mask-to-ion Pearson correlations without per-feature loops."""
++    mask = np.asarray(binary_mask, dtype=np.float64)
++    mask -= mask.mean()
++    mask_norm = np.sqrt(np.dot(mask, mask))
++    correlations = np.zeros(spectra.shape[1], dtype=np.float64)
++    if mask_norm == 0:
++        return correlations
+ 
+-    all_spectra = []
+-    XCoord = []
+-    YCoord = []
+-    for idx, (x,y,z) in enumerate(p.coordinates):
+-        mzs, intensities = p.getspectrum(idx)
+-        all_spectra.append(intensities)
+-        XCoord.append(x)
+-        YCoord.append(y)
++    for start in range(0, spectra.shape[1], chunk_size):
++        stop = min(start + chunk_size, spectra.shape[1])
++        values = np.asarray(spectra[:, start:stop], dtype=np.float64)
++        values -= values.mean(axis=0, keepdims=True)
++        denominator = mask_norm * np.sqrt(np.sum(values * values, axis=0))
++        numerator = mask @ values
++        np.divide(
++            numerator,
++            denominator,
++            out=correlations[start:stop],
++            where=denominator != 0,
++        )
++    return correlations
+ 
+-    for class_number in segmentation_classes:
+-        mask = np.where(mask_orig == class_number, 1, 0)
+ 
+-        all_spectra = np.array(all_spectra)
+-        mask_flattened = []
+-        for i in range(len(XCoord)):
+-            mask_flattened.append(mask[YCoord[i]-1, XCoord[i]-1])
++def create_pearson_labels(
++    dataname,
++    folderpath,
++    num_classes,
++    data_path=None,
++):
++    """Create PCC rankings for either imzML or MassNet HDF5 spectra."""
++    folder = Path(folderpath)
++    labels_dir = folder / "labels"
++    labels_dir.mkdir(exist_ok=True)
+ 
+-        pearson_correlations = []
+-        for idx, mz in enumerate(all_mz):
+-            ion_image = all_spectra[:,idx]
+-            pearson_corr = stats.pearsonr(mask_flattened, ion_image).correlation
++    mask_path = folder / "masks" / f"{dataname}_mask.npy"
++    mask_orig = np.load(mask_path)
++    source_path = Path(data_path) if data_path else folder / f"{dataname}.imzML"
++    table = load_spectrum_table(source_path)
+ 
+-            if math.isnan(pearson_corr):
+-                pearson_correlations.append(0)
+-            else:
+-                pearson_correlations.append(pearson_corr)
++    rows = table.y - 1
++    columns = table.x - 1
++    if np.any(rows >= mask_orig.shape[0]) or np.any(columns >= mask_orig.shape[1]):
++        raise ValueError(
++            f"{dataname}: spectrum coordinates exceed mask shape {mask_orig.shape}"
++        )
++
++    for class_number in range(num_classes):
++        mask_at_spectra = (mask_orig[rows, columns] == class_number).astype(np.uint8)
++        pearson_correlations = _pearson_by_feature(
++            mask_at_spectra,
++            table.spectra,
++        )
+ 
+         ranking = np.argsort(pearson_correlations)[::-1]
+-        mz_values = [all_mz[rank] for rank in ranking]
+-        pearson_correlations = [pearson_correlations[rank] for rank in ranking]
+-
+-        np.save(folderpath + 'labels/' + dataname + '_class' + str(class_number) + '_ranking.npy', ranking)
+-        np.save(folderpath + 'labels/' + dataname + '_class' + str(class_number) + '_mz_ranking.npy', mz_values)
+-        np.save(folderpath + 'labels/' + dataname + '_class' + str(class_number) + '_pearson_ranking.npy', pearson_correlations)+        np.save(labels_dir / f"{dataname}_class{class_number}_ranking.npy", ranking)
++        np.save(
++            labels_dir / f"{dataname}_class{class_number}_mz_ranking.npy",
++            table.mz_values[ranking],
++        )
++        np.save(
++            labels_dir / f"{dataname}_class{class_number}_pearson_ranking.npy",
++            pearson_correlations[ranking],
++        )
+--- a/s3pl/utils/helpers.py
++++ b/baselines/s3pl/utils/helpers.py
+@@ -1,17 +1,78 @@
++# Modified from S3PL v1.0.0 (https://github.com/CeMOS-IS/S3PL, commit 660e3d9) for Spatial-msiPL,
++# October 2026. Licensed under AGPL-3.0 (baselines/s3pl/LICENSE); changes are listed
++# in baselines/s3pl/CHANGES.md and changes_from_660e3d9.diff.
+ import os
++from pathlib import Path
++
+ import numpy as np
+ 
+ from utils.create_pearson_labels import create_pearson_labels
+ 
+-def tic_norm_spectra(arr):
++
++def resolve_data_paths(data_path, project_dir):
++    """Resolve an imzML path and return its containing folder with a separator."""
++    path = Path(data_path).expanduser()
++    if not path.is_absolute():
++        path = Path(project_dir) / path
++
++    path = path.resolve()
++    folder = str(path.parent) + os.sep
++    return str(path), folder, path.stem
++
++
++def artifact_directories(config, project_dir):
++    """Return central artifact directories when an artifact root is configured."""
++    artifact_root = config.get("artifact_root")
++    if artifact_root:
++        root = Path(artifact_root).expanduser().resolve()
++        return {
++            "weights": root / "checkpoints" / "baselines" / "s3pl",
++            "logs": root / "logs" / "s3pl",
++            "results": root / "results" / "baselines" / "s3pl",
++        }
++
++    root = Path(project_dir)
++    return {
++        "weights": root / "weights",
++        "logs": root / "logs",
++        "results": root / "results",
++    }
++
++NORMALIZATION_METHODS = ("reference_spatial_max", "paper_tic")
++
++
++def reference_spatial_max_norm(arr):
++    """Preserve the normalization shipped in the reference S3PL code."""
+     max_vals = np.max(arr, axis=2, keepdims=True)
+     max_vals[max_vals == 0] = 1 # avoid division by zero
+     normalized = arr / max_vals
+     return normalized
+ 
+-def check_for_labels(folderpath, dataname):
++
++def paper_tic_norm(arr):
++    """Normalize every [m/z] spectrum by its total ion count."""
++    totals = np.sum(arr, axis=1, keepdims=True, dtype=np.float32)
++    totals[totals == 0] = 1
++    return arr / totals
++
++
++def normalize_spectra(arr, method="reference_spatial_max"):
++    if method == "reference_spatial_max":
++        return reference_spatial_max_norm(arr)
++    if method == "paper_tic":
++        return paper_tic_norm(arr)
++    raise ValueError(
++        f"Unknown normalization {method!r}; expected one of {NORMALIZATION_METHODS}"
++    )
++
++
++def tic_norm_spectra(arr):
++    """Backward-compatible name for the reference implementation's operation."""
++    return reference_spatial_max_norm(arr)
++
++def check_for_labels(folderpath, dataname, data_path=None):
+     if not os.path.exists(folderpath + 'masks/' + dataname + '_mask.npy'):
+-        raise Exception('There is no mask given for the file ' + dataname + '.imzML in the folder "' + folderpath + 'masks/". The mask should have the name "' + dataname + '_mask.npy".')
++        raise Exception('There is no mask given for ' + dataname + ' in the folder "' + folderpath + 'masks/". The mask should have the name "' + dataname + '_mask.npy".')
+     
+     num_classes = len(np.unique(np.load(folderpath + 'masks/' + dataname + '_mask.npy')))
+     labels_are_missing = False
+@@ -28,4 +89,4 @@
+             labels_are_missing = True
+     
+     if labels_are_missing:
+-        create_pearson_labels(dataname, folderpath, num_classes)+        create_pearson_labels(dataname, folderpath, num_classes, data_path=data_path)
+--- a/s3pl/utils/PeakEvaluation.py
++++ b/baselines/s3pl/utils/PeakEvaluation.py
+@@ -1,3 +1,6 @@
++# Modified from S3PL v1.0.0 (https://github.com/CeMOS-IS/S3PL, commit 660e3d9) for Spatial-msiPL,
++# October 2026. Licensed under AGPL-3.0 (baselines/s3pl/LICENSE); changes are listed
++# in baselines/s3pl/CHANGES.md and changes_from_660e3d9.diff.
+ import numpy as np
+ import matplotlib.pyplot as plt
+ 
+@@ -11,7 +14,7 @@
+     Optional: show picked ion images, normalize results in case of major deviations between the number of ground truth positive peaks and the number of picked peaks.
+     """
+ 
+-    def __init__(self, dataname, num_classes, pearson_threshold, folderpath, peak_list, show_ion_images = False, normalise_results = False):
++    def __init__(self, dataname, num_classes, pearson_threshold, folderpath, peak_list, show_ion_images = False, normalise_results = False, mz_values=None):
+         self.dataname = dataname
+         self.num_classes = num_classes
+         self.pearson_threshold = pearson_threshold
+@@ -21,8 +24,12 @@
+         self.number_picked_peaks = len(peak_list)
+         self.normalise_results = normalise_results
+ 
+-        self.parser = ImzMLParser(folderpath + dataname + '.imzML')
+-        self.all_mz, _ = self.parser.getspectrum(0)
++        self.parser = None
++        if mz_values is None:
++            self.parser = ImzMLParser(folderpath + dataname + '.imzML')
++            self.all_mz, _ = self.parser.getspectrum(0)
++        else:
++            self.all_mz = np.asarray(mz_values)
+ 
+         for idx, mz in enumerate(self.peak_list):
+             if mz not in self.all_mz:
+@@ -75,6 +82,8 @@
+         FN = len(set(self.non_peaks) & set(self.true_peaks)) 
+         TN = len(set(self.non_peaks) & set(self.false_peaks))
+         
++        if self.show_ion_images and self.parser is None:
++            raise ValueError("Ion-image display is only available for imzML inputs")
+         if self.show_ion_images:
+             for peak in self.peak_list:
+                 img = getionimage(self.parser, peak, tol=0.0001)
+@@ -126,7 +135,7 @@
+     Optional: show picked ion images, normalize results in case of major deviations between the number of ground truth positive peaks and the number of picked peaks.
+     """
+         
+-    def __init__(self, dataname, num_classes, pearson_threshold, folderpath, peak_list, show_ion_images = False, normalise_results = False):
++    def __init__(self, dataname, num_classes, pearson_threshold, folderpath, peak_list, show_ion_images = False, normalise_results = False, mz_values=None):
+         self.dataname = dataname
+         self.num_classes = num_classes
+         self.pearson_threshold = pearson_threshold
+@@ -136,8 +145,12 @@
+         self.number_picked_peaks = len(peak_list)
+         self.normalise_results = normalise_results
+ 
+-        self.parser = ImzMLParser(folderpath + dataname + '.imzML')
+-        self.all_mz, _ = self.parser.getspectrum(0)
++        self.parser = None
++        if mz_values is None:
++            self.parser = ImzMLParser(folderpath + dataname + '.imzML')
++            self.all_mz, _ = self.parser.getspectrum(0)
++        else:
++            self.all_mz = np.asarray(mz_values)
+ 
+         for idx, mz in enumerate(self.peak_list):
+             if mz not in self.all_mz:
+@@ -203,6 +216,8 @@
+             FN = len(set(self.non_peaks) & set(self.groundtruth["true_peaks_class" + str(class_id)])) 
+             TN = len(set(self.non_peaks) & set(self.groundtruth["false_peaks_class" + str(class_id)]))
+             
++            if self.show_ion_images and self.parser is None:
++                raise ValueError("Ion-image display is only available for imzML inputs")
+             if self.show_ion_images:
+                 for peak in self.peak_list:
+                     img = getionimage(self.parser, peak, tol=0.0001)
+@@ -251,4 +266,4 @@
+             }
+ 
+             class_metrics["class " + str(class_id)] = metrics
+-        return class_metrics+        return class_metrics

@@ -1,0 +1,23 @@
+# Added for Spatial-msiPL (October 2026) as part of the modified S3PL in baselines/s3pl;
+# licensed under AGPL-3.0 (baselines/s3pl/LICENSE).
+name: s3pl_env
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+dependencies:
+  - python=3.11.5
+  - pip
+  - pytorch=2.3.0
+  - torchvision=0.18.0
+  - pytorch-cuda=12.1
+  - numpy
+  - pandas
+  - tqdm
+  - matplotlib
+  - scikit-learn
+  - scipy
+  - h5py
+  - pip:
+      - m2aia
+      - pyimzml

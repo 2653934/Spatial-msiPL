@@ -1,0 +1,10 @@
+# RCC export from CardinalWorkflows to HDF5 (scripts/rcc_feasibility_export.R).
+name: rcc_export
+channels:
+  - conda-forge
+  - bioconda
+dependencies:
+  - r-base=4.5.3
+  - bioconductor-cardinal=3.12.1
+  - bioconductor-cardinalio=1.8.0
+  - bioconductor-rhdf5=2.56.1

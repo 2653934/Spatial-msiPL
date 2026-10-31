@@ -1,0 +1,16 @@
+# Legacy msiPL environment (reproduction, Beta tuning and the budget re-tune); msiPL itself
+# is cloned separately at commit 1e8d5cf (see baselines/msipl/README.md).
+name: msipl_legacy
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.6.10
+  - numpy=1.14.2
+  - scipy=1.0.0
+  - scikit-learn=0.19.1
+  - h5py=2.7.1
+  - pip
+  - pip:
+      - tensorflow==1.8.0
+      - keras==2.1.5

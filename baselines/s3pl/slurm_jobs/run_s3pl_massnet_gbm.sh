@@ -1,0 +1,116 @@
+#!/bin/bash
+# Added for Spatial-msiPL (October 2026) as part of the modified S3PL in baselines/s3pl;
+# licensed under AGPL-3.0 (baselines/s3pl/LICENSE).
+#SBATCH --job-name=s3pl-gbm
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=4
+#SBATCH --partition=bigbatch
+#SBATCH --time=12:00:00
+#SBATCH --mem=32G
+#SBATCH --output=logs/s3pl-gbm-%j.out
+#SBATCH --error=logs/s3pl-gbm-%j.err
+
+_paths="$(dirname "${BASH_SOURCE[0]}")/paths.sh"; [ -f "$_paths" ] || _paths="${SPATIAL_MSIPL_ROOT:-$HOME/msi}/slurm_jobs/paths.sh"; source "$_paths"
+set -eo pipefail
+
+DATASET="${1:-GBM108_positive}"
+EPOCHS="${2:-10}"
+EVALUATE="${3:-true}"
+PATCH_SIZE="${4:-3}"
+ARTIFACT_ROOT="${5:-$PROJECT_ROOT}"
+NORMALIZATION="${6:-reference_spatial_max}"
+RANDOM_SEED="${7:-1}"
+INITIALIZATION_SEED="${8:-}"
+SAMPLE_ORDER_SEED="${9:-}"
+
+case "$DATASET" in
+    GBM108_negative|GBM108_positive|GBM12_1|GBM12_2|GBM22_1|GBM22_2|GBM39_1|GBM39_2)
+        ;;
+    *)
+        echo "Unknown MassNet GBM section: $DATASET" >&2
+        exit 2
+        ;;
+esac
+
+if ! [[ "$EPOCHS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Epochs must be a positive integer: $EPOCHS" >&2
+    exit 2
+fi
+
+if ! [[ "$PATCH_SIZE" =~ ^[1-9][0-9]*$ ]] || (( PATCH_SIZE % 2 == 0 )); then
+    echo "Patch size must be a positive odd integer: $PATCH_SIZE" >&2
+    exit 2
+fi
+
+case "$ARTIFACT_ROOT" in
+    "$PROJECT_ROOT"|"$PROJECT_ROOT"/*)
+        ;;
+    *)
+        echo "Artifact root must stay inside $PROJECT_ROOT: $ARTIFACT_ROOT" >&2
+        exit 2
+        ;;
+esac
+
+case "$EVALUATE" in
+    true)
+        EVAL_FLAG="--eval_picking"
+        ;;
+    false)
+        EVAL_FLAG="--no-eval_picking"
+        ;;
+    *)
+        echo "Evaluation must be true or false: $EVALUATE" >&2
+        exit 2
+        ;;
+esac
+
+case "$NORMALIZATION" in
+    reference_spatial_max|paper_tic)
+        ;;
+    *)
+        echo "Normalization must be reference_spatial_max or paper_tic: $NORMALIZATION" >&2
+        exit 2
+        ;;
+esac
+
+if ! [[ "$RANDOM_SEED" =~ ^[0-9]+$ ]]; then
+    echo "Random seed must be a nonnegative integer: $RANDOM_SEED" >&2
+    exit 2
+fi
+
+SEED_FLAGS=()
+if [[ -n "$INITIALIZATION_SEED" || -n "$SAMPLE_ORDER_SEED" ]]; then
+    if ! [[ "$INITIALIZATION_SEED" =~ ^[0-9]+$ && "$SAMPLE_ORDER_SEED" =~ ^[0-9]+$ ]]; then
+        echo "Controlled diagnostic requires two nonnegative seeds: initialization and sample order." >&2
+        exit 2
+    fi
+    SEED_FLAGS=(--initialization_seed "$INITIALIZATION_SEED" --sample_order_seed "$SAMPLE_ORDER_SEED")
+fi
+
+S3PL_ROOT="$PROJECT_ROOT/baselines/s3pl"
+DATA_PATH="$DATA_ROOT/gbm_massnet/${DATASET}.h5"
+
+source "$SPATIAL_MSIPL_CONDA_SH"
+conda activate s3pl_env
+
+python -c 'import sys, torch; sys.exit(0 if torch.cuda.is_available() and torch.ones(1, device="cuda").item() == 1.0 else "CUDA is unavailable on this node; refusing to run S3PL on CPU.")'
+
+cd "$S3PL_ROOT"
+python main.py \
+    --data_dir "$DATA_PATH" \
+    --artifact_root "$ARTIFACT_ROOT" \
+    --number_classes 2 \
+    --n_epochs "$EPOCHS" \
+    --spectral_patch_size "$PATCH_SIZE" \
+    --peaks_per_spectral_patch 256 \
+    --batch_size 16 \
+    --learning_rate 0.01 \
+    --kernel_depth_d1 51 \
+    --kernel_depth_d2 1 \
+    --dropout 0 \
+    --normalization "$NORMALIZATION" \
+    --input-context-mode none \
+    --random_seed "$RANDOM_SEED" \
+    "${SEED_FLAGS[@]}" \
+    "$EVAL_FLAG"

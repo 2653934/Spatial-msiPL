@@ -1,0 +1,274 @@
+# Modified from S3PL v1.0.0 (https://github.com/CeMOS-IS/S3PL, commit 660e3d9) for Spatial-msiPL,
+# October 2026. Licensed under AGPL-3.0 (baselines/s3pl/LICENSE); changes are listed
+# in baselines/s3pl/CHANGES.md and changes_from_660e3d9.diff.
+import os
+import numpy as np
+import pandas as pd
+import json
+
+import torch
+from torch.utils.data import DataLoader, SubsetRandomSampler
+from torchvision import transforms
+import tqdm
+
+from utils.PeakEvaluation import PeakEvaluation, PeakEvaluationMultipleClasses
+from utils.data_source import build_patch_dataset
+from utils.helpers import (
+    artifact_directories,
+    check_for_labels,
+    normalize_spectra,
+    resolve_data_paths,
+)
+from model.Attention3DConvAutoencoder import Attention3DConvAutoencoder
+import data_configs
+
+
+def ablate_patch_context(batch, mode):
+    """Change only noncentral patch positions after the saved normalisation."""
+    if mode == "none":
+        return batch
+    if mode not in ("zero_noncentral", "tile_centre", "rotate_90", "permute_within_rings"):
+        raise ValueError(f"Unknown frozen input ablation: {mode}")
+    if batch.ndim != 5 or batch.shape[-1] != batch.shape[-2] or batch.shape[-1] % 2 != 1:
+        raise ValueError("S3PL batch must have shape (batch, channel, mz, odd_y, odd_x)")
+    centre = batch.shape[-1] // 2
+    if mode == "rotate_90":
+        return torch.rot90(batch, 1, dims=(-2, -1))
+    if mode == "permute_within_rings":
+        permuted = batch.clone()
+        for radius in range(1, centre + 1):
+            ring = [
+                (row, column)
+                for row in range(centre - radius, centre + radius + 1)
+                for column in range(centre - radius, centre + radius + 1)
+                if max(abs(row - centre), abs(column - centre)) == radius
+            ]
+            rows, columns = zip(*ring)
+            source_rows, source_columns = zip(*(ring[1:] + ring[:1]))
+            permuted[..., rows, columns] = batch[..., source_rows, source_columns]
+        return permuted
+    if mode == "tile_centre":
+        return batch[..., centre : centre + 1, centre : centre + 1].expand_as(batch).clone()
+    ablated = torch.zeros_like(batch)
+    ablated[..., centre, centre] = batch[..., centre, centre]
+    return ablated
+
+def test(
+    config,
+    test_indices,
+    number_peaks_override=None,
+    result_suffix="",
+    input_ablation="none",
+):
+    if input_ablation not in ("none", "zero_noncentral", "tile_centre", "rotate_90", "permute_within_rings"):
+        raise ValueError(f"Unknown frozen input ablation: {input_ablation}")
+    training_name = config["training_name"]
+    directory_name = os.path.dirname(__file__)
+    artifact_dirs = artifact_directories(config, directory_name)
+    model_path = artifact_dirs["weights"] / (training_name + '.pt')
+    config_path = artifact_dirs["logs"] / (training_name + '.json')
+
+    with open(config_path) as f:
+        config = json.load(f)
+    training_context_mode = config.get("input_context_mode", "none")
+    if training_context_mode not in ("none", "tile_centre", "shuffle_nonlocal"):
+        raise ValueError(f"Unsupported training input context: {training_context_mode}")
+    if training_context_mode != "none" and input_ablation != "none":
+        raise ValueError("Do not combine a trained input control with a frozen input intervention")
+    effective_input_mode = training_context_mode if input_ablation == "none" else input_ablation
+
+    if number_peaks_override is not None:
+        if number_peaks_override < 1:
+            raise ValueError("number_peaks_override must be positive")
+        config["number_peaks"] = int(number_peaks_override)
+
+    data_dir = config["data_dir"]
+    filepath, folderpath, dataname = resolve_data_paths(data_dir, directory_name)
+
+    spectral_patch_size = config["spectral_patch_size"]
+
+    if type(config["number_peaks"]) is int:
+        number_peaks = config["number_peaks"]
+    else:
+        number_peaks = data_configs.num_GT_peaks[dataname]
+
+    if type(config["number_classes"]) is int:
+        number_classes = config["number_classes"]
+    else:
+        number_classes = data_configs.number_classes[dataname]
+
+    normalization = config.get("normalization", "reference_spatial_max")
+    transform = transforms.Lambda(
+        lambda x: torch.tensor(
+            normalize_spectra(x, normalization), dtype=torch.float32
+        )
+    )
+    if training_context_mode == "shuffle_nonlocal":
+        # Test N: inference sees the same shuffled patches as training.
+        test_dataset, mz_values = build_patch_dataset(
+            filepath,
+            config["spectral_patch_size"],
+            transform,
+            neighbour_shuffle_seed=config["neighbour_shuffle_seed"],
+        )
+    else:
+        test_dataset, mz_values = build_patch_dataset(
+            filepath,
+            config["spectral_patch_size"],
+            transform,
+        )
+    mz_list = torch.tensor(mz_values)
+    if test_indices is None:
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            drop_last=False,
+        )
+    else:
+        test_sampler = SubsetRandomSampler(test_indices)
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=1,
+            shuffle=False,
+            drop_last=False,
+            sampler=test_sampler,
+        )
+
+    model = Attention3DConvAutoencoder(batchsize=1, kernel_depth_d1=config["kernel_depth_d1"], kernel_depth_d2=config["kernel_depth_d2"], dropout=config["dropout"], spectral_patch_size=config["spectral_patch_size"])
+    model.load_state_dict(torch.load(str(model_path), map_location=torch.device('cpu')), strict=False)
+    model.eval()
+
+    use_cuda = torch.cuda.is_available()
+    if use_cuda:
+        model = model.cuda()
+        mz_list = mz_list.cuda()
+
+    peak_selection = {}
+    controlled_seed_diagnostic = (
+        config.get("initialization_seed") is not None
+        and config.get("sample_order_seed") is not None
+    )
+    with tqdm.tqdm(test_loader, unit="batch") as bar:
+        for batch in bar:
+            bar.set_description(f"Test")
+
+            X_batch, _ = batch             
+            y_batch = X_batch
+            
+            if use_cuda:
+                X_batch = X_batch.cuda()
+                y_batch = y_batch.cuda()
+
+            if effective_input_mode != "shuffle_nonlocal":  # already in the patch
+                X_batch = ablate_patch_context(X_batch, effective_input_mode)
+
+            y_pred, binary_mask, attention_mask = model(X_batch)
+
+            attention_mask = attention_mask.squeeze()
+            peaks_per_spectral_patch = config["peaks_per_spectral_patch"]
+            _, indices = torch.topk(attention_mask, peaks_per_spectral_patch)
+            indices = torch.unique(indices)
+            picked_peaks = torch.index_select(mz_list, 0, indices)
+
+            X_batch = X_batch.cpu().detach().numpy()
+            y_batch = y_batch.cpu().detach().numpy()
+            picked_peaks = picked_peaks.cpu().detach().numpy()
+            attention_mask = attention_mask.cpu().detach().numpy()
+
+            for mz_value in picked_peaks:
+                if mz_value in peak_selection:
+                    peak_selection[mz_value] += 1
+                else:
+                    peak_selection[mz_value] = 1
+
+    sorted_peak_list = [mz_value for counts, mz_value in sorted(zip(list(peak_selection.values()), list(peak_selection.keys())))[::-1]]
+    print('length of peak selection before cut-off = ' + str(len(sorted_peak_list)))
+    peak_list = sorted_peak_list[:number_peaks]
+
+    resultfolder = artifact_dirs["results"] / (training_name + result_suffix)
+    filename_peak_evaluation = resultfolder / ('peak_evaluation_' + dataname + '_' + str(config["n_epochs"]) + 'epochs.txt')
+
+    resultfolder.mkdir(parents=True, exist_ok=True)
+
+    df = pd.DataFrame(peak_list)
+    df.to_csv(resultfolder / ('picked_peaks_' + dataname + '_' + str(peaks_per_spectral_patch) + 'peaks_z_patchsize_' + str(spectral_patch_size) + '.csv'), index=False)
+    if controlled_seed_diagnostic:
+        # Preserve the released peak ranking; expose the votes that produced it.
+        pd.DataFrame(
+            {
+                "rank": range(1, len(sorted_peak_list) + 1),
+                "mz": sorted_peak_list,
+                "pixel_topk_votes": [peak_selection[mz] for mz in sorted_peak_list],
+                "selected": [rank < number_peaks for rank in range(len(sorted_peak_list))],
+            }
+        ).to_csv(resultfolder / "peak_vote_diagnostics.csv", index=False)
+
+    mSCF1 = None
+    if config["evaluate_peak_picking"]:
+        check_for_labels(folderpath, dataname, filepath)
+        evaluation_metrics = {
+            "dataset": dataname,
+            "normalization": normalization,
+            "number_picked_peaks": len(peak_list),
+            "peak_count_source": (
+                "explicit_matched_override"
+                if number_peaks_override is not None
+                else "training_configuration_or_data_default"
+            ),
+            "source_training_name": training_name,
+            "frozen_input_ablation": input_ablation,
+            "training_input_context_mode": training_context_mode,
+            "effective_input_context_mode": effective_input_mode,
+            "class_metrics": {},
+            "mixed_f1": {},
+        }
+
+        with open(filename_peak_evaluation, 'w') as file:
+            file.write(training_name + ':\n')
+            file.write('number picked peaks = ' + str(len(peak_list)) + ', Recall/Precision/F1-Score/Correlation-Score\n')
+
+        print(training_name + ':\n')
+        print('number picked peaks = ' + str(len(peak_list)))
+
+        for pcc_threshold in [0.3, 0.4, 0.5, 0.6]:
+            evaluate_peaks = PeakEvaluationMultipleClasses(dataname, list(range(number_classes)), pcc_threshold, folderpath, peak_list, show_ion_images=False, mz_values=mz_values)
+            class_metrics = evaluate_peaks.calculate_metrics()
+            evaluation_metrics["class_metrics"][str(pcc_threshold)] = class_metrics
+
+            with open(filename_peak_evaluation, 'a') as file:
+                file.write('T_PCC = ' + str(pcc_threshold) + '\n')
+            for class_name, metrics in class_metrics.items():
+                recall = metrics["recall"]
+                precision = metrics["precision"]
+                F1 = metrics["F1"]
+
+                with open(filename_peak_evaluation, 'a') as file:
+                    file.write(str(class_name) + '\n')
+                    file.write(str(round(F1,3)) + '\n')
+
+        with open(filename_peak_evaluation, 'a') as file:
+            file.write('\nF1-Score MixedClasses:\n')
+
+        F1_scores_mixed = []
+        for pcc_threshold in [0.3, 0.4, 0.5, 0.6]:      
+            evaluate_peaks = PeakEvaluation(dataname, list(range(number_classes)), pcc_threshold, folderpath, peak_list, show_ion_images=False, mz_values=mz_values)
+            recall, precision, F1 = evaluate_peaks.calculate_metrics()
+
+            F1_scores_mixed.append(F1)
+            evaluation_metrics["mixed_f1"][str(pcc_threshold)] = F1
+            with open(filename_peak_evaluation, 'a') as file:
+                file.write('F1 ' + str(pcc_threshold) + ' = ')
+                file.write(str(round(F1,3)) + '\n')
+            print('F1 ' + str(pcc_threshold) + ' = ' + str(round(F1,3)) + '\n')
+
+        mSCF1 = float(round(np.mean(F1_scores_mixed),3))
+        evaluation_metrics["mSCF1"] = mSCF1
+        with open(filename_peak_evaluation, 'a') as file:
+            file.write('mSCF1 = ' + str(mSCF1) + '\n')
+        print('mSCF1 = ' + str(mSCF1) + '\n')
+
+        with open(resultfolder / 'metrics.json', 'w') as file:
+            json.dump(evaluation_metrics, file, indent=4)
+    
+    return mSCF1

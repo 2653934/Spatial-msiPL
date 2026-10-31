@@ -1,0 +1,35 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below, together with msiPL and S3PL."
+title: "Spatial-msiPL: spatial-aware peak ranking for mass spectrometry imaging"
+version: "1.0"
+license: MIT
+repository-code: "https://github.com/2653934/Spatial-msiPL"
+authors:
+  - family-names: Suliman
+    given-names: Zayd
+    affiliation: "University of the Witwatersrand"
+preferred-citation:
+  type: thesis
+  title: "Spatial Aware Peak Ranking in Mass Spectrometry Imaging"
+  authors:
+    - family-names: Suliman
+      given-names: Zayd
+  institution:
+    name: "University of the Witwatersrand"
+  year: 2026
+references:
+  - type: article
+    title: "Peak learning of mass spectrometry imaging data using artificial neural networks"
+    authors:
+      - family-names: Abdelmoula
+        given-names: Walid M.
+    journal: "Nature Communications"
+    year: 2021
+  - type: article
+    title: "Spatial self-supervised Peak Learning and correlation-based Evaluation of peak picking in Mass Spectrometry Imaging"
+    authors:
+      - family-names: Weigand
+    identifiers:
+      - type: other
+        value: "arXiv:2603.10487"
+    year: 2026

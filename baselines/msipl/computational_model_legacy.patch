@@ -1,0 +1,29 @@
+--- a/Computational_Model.py
++++ b/Computational_Model_legacy.py
+@@ -8,7 +8,7 @@
+ """
+ 
+ import numpy as np
+-from keras.layers import Lambda, Input, Dense, ReLU, BatchNormalization
++from keras.layers import Lambda, Input, Dense, Activation, BatchNormalization
+ from keras.models import Model
+ from keras.losses import  categorical_crossentropy
+ from keras.utils import plot_model
+@@ -40,7 +40,7 @@
+         inputs = Input(shape=input_shape, name='encoder_input')
+         h = Dense(self.intermediate_dim)(inputs)
+         h = BatchNormalization()(h)
+-        h = ReLU()(h)
++        h = Activation("relu")(h)
+         z_mean = Dense(self.latent_dim, name = 'z_mean')(h)
+         z_mean = BatchNormalization()(z_mean)
+         z_log_var = Dense(self.latent_dim, name = 'z_log_var')(h)
+@@ -57,7 +57,7 @@
+         latent_inputs = Input(shape = (self.latent_dim,), name='Latent_Space')
+         hdec = Dense(self.intermediate_dim)(latent_inputs)
+         hdec = BatchNormalization()(hdec)
+-        hdec = ReLU()(hdec)
++        hdec = Activation("relu")(hdec)
+         outputs = Dense(self.nSpecFeatures, activation = 'sigmoid')(hdec)
+         decoder = Model(latent_inputs, outputs, name = 'decoder')
+         print("==== Decoder Architecture...")

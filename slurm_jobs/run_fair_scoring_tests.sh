@@ -1,0 +1,70 @@
+#!/bin/bash
+# Compatibility test of the fair-scoring code under the cluster's s3pl_env
+# (Python 3.11). CPU-only; synthetic data only; reads no real section.
+# Submit with: sbatch slurm_jobs/run_fair_scoring_tests.sh
+#SBATCH --job-name=fair-scoring-tests
+#SBATCH --partition=batch
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem=8G
+#SBATCH --time=00:30:00
+#SBATCH --output=logs/fair-scoring-tests-%j.out
+#SBATCH --error=logs/fair-scoring-tests-%j.err
+
+_paths="$(dirname "${BASH_SOURCE[0]}")/paths.sh"; [ -f "$_paths" ] || _paths="${SPATIAL_MSIPL_ROOT:-$HOME/msi}/slurm_jobs/paths.sh"; source "$_paths"
+set -euo pipefail
+: "${SLURM_JOB_ID:?Submit with sbatch; do not run tests on the login node}"
+
+PYTHON="$SPATIAL_MSIPL_PYTHON"
+RECORD_DIR="$PROJECT_ROOT/results/validation/fair_scoring_env_tests"
+mkdir -p "$PROJECT_ROOT/logs" "$RECORD_DIR"
+cd "$PROJECT_ROOT"
+export PYTHONPATH="$PROJECT_ROOT/src:$PROJECT_ROOT/scripts${PYTHONPATH:+:$PYTHONPATH}"
+export OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 MPLBACKEND=Agg
+
+"$PYTHON" - <<'PY' | tee "$RECORD_DIR/${SLURM_JOB_ID}_versions.json"
+import json, platform, sys
+import h5py, matplotlib, numpy, scipy, sklearn
+print(json.dumps({
+    "python": sys.version.split()[0], "platform": platform.platform(),
+    "numpy": numpy.__version__, "scipy": scipy.__version__,
+    "sklearn": sklearn.__version__, "h5py": h5py.__version__,
+    "matplotlib": matplotlib.__version__,
+}, indent=2))
+PY
+
+"$PYTHON" -m unittest -v \
+    spatial_msipl.tests.test_peak_groups \
+    spatial_msipl.tests.test_simple_baselines \
+    spatial_msipl.tests.test_gate_d_helpers \
+    spatial_msipl.tests.test_provenance \
+    spatial_msipl.tests.test_peak_selection \
+    spatial_msipl.tests.test_evaluation \
+    spatial_msipl.tests.test_fair_scoring_pipeline \
+    spatial_msipl.tests.test_fair_scoring_summary \
+    spatial_msipl.tests.test_fair_scoring_arms \
+    spatial_msipl.tests.test_centre_masking \
+    spatial_msipl.tests.test_neighbourhood \
+    spatial_msipl.tests.test_rcc_pipeline \
+    spatial_msipl.tests.test_spatial_segmentation \
+    spatial_msipl.tests.test_test_r \
+    spatial_msipl.tests.test_ig_steps \
+    spatial_msipl.tests.test_msipl_retune \
+    spatial_msipl.tests.test_training_length \
+    spatial_msipl.tests.test_ranking_stage_runtime \
+    spatial_msipl.tests.test_runtime_v2 \
+    spatial_msipl.tests.test_segmentation_control_v \
+    spatial_msipl.tests.test_pca_reconstruction_v \
+    spatial_msipl.tests.test_s3pl_shuffle_control \
+    2>&1 | tee "$RECORD_DIR/${SLURM_JOB_ID}_unittest.log"
+# Test N (protocol 18 Section 6.5): the S3PL patch tests run from the S3PL folder,
+# where m2aia, pyimzml and torch let the real-m2aia and training-call tests run.
+(cd baselines/s3pl && "$PYTHON" -m unittest -v tests.test_nonlocal_shuffle \
+    tests.test_frozen_patch_context tests.test_h5_data_source) \
+    2>&1 | tee "$RECORD_DIR/${SLURM_JOB_ID}_s3pl_unittest.log"
+# Investigation 21 Part C: the seed flags' default path against its frozen copy (torch, CPU).
+# GPUs are hidden for this module only, so the identity gate never runs on CUDA.
+(cd baselines/s3pl && CUDA_VISIBLE_DEVICES="" "$PYTHON" -m unittest -v tests.test_seed_flags_default) \
+    2>&1 | tee -a "$RECORD_DIR/${SLURM_JOB_ID}_s3pl_unittest.log"
+echo "All fair-scoring tests passed under s3pl_env."

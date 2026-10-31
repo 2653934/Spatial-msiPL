@@ -1,0 +1,41 @@
+# Raw data and converted inputs (download from the original sources; see README)
+data/
+*.h5
+*.hdf5
+*.imzML
+*.imzml
+*.ibd
+*.rda
+*.zip
+*.7z
+*.tar.gz
+
+# Model checkpoints and weights
+checkpoints/
+weights/
+*.pt
+*.pth
+*.ckpt
+
+# Slurm and run logs
+logs/
+*.out
+*.err
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+.pym2aia_prefs.xml
+
+# Regenerated figures and the user's msiPL clone
+report_figures/output/
+baselines/msipl/msiPL/
