@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use this software, please cite it as below, together with msiPL and S3PL."
 title: "Spatial-msiPL: spatial-aware peak ranking for mass spectrometry imaging"
-version: "1.0"
+version: "1.1"
 license: MIT
 repository-code: "https://github.com/2653934/Spatial-msiPL"
 authors:

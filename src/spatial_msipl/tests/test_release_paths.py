@@ -118,7 +118,8 @@ class PublicTreeHygieneTests(unittest.TestCase):
         self.assertEqual(offenders, [])
 
     def test_figure_scripts_read_and_write_configurable_locations(self):
-        for name in ("seed_averaged_figures.py", "dataset_overview.py", "runtime_figure.py"):
+        for name in ("seed_averaged_figures.py", "dataset_overview.py", "runtime_figure.py",
+                     "qualitative_example.py"):
             text = (ROOT / "report_figures" / name).read_text(encoding="utf-8")
             self.assertIn('os.environ.get("SPATIAL_MSIPL_RESULTS"', text, name)
             self.assertIn('os.environ.get("SPATIAL_MSIPL_FIGURE_OUTPUT"', text, name)

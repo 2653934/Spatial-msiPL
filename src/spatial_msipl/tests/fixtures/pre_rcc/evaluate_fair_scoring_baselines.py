@@ -10,7 +10,7 @@ No retraining and no GPU. For one section and one frozen IG arm this script:
    variance, Moran's I, random) and the labelled supervised oracle ceiling at
    K_bin and at the predeclared budget multipliers;
 3. reports partition-free collapse diagnostics (rule A runs);
-4. only with a explicitly approved partition file, adds matched peak-level
+4. only with a reviewer-approved partition file, adds matched peak-level
    scoring at K_peak and the K_bin collapse under each approved partition.
 
 Every reported peak-level number can be reconstructed from the saved
@@ -108,7 +108,7 @@ def parse_arguments():
     parser.add_argument("--partition-dir", type=Path,
                         help="audit_peak_partitions.py output for this section")
     parser.add_argument("--partition-approval", type=Path,
-                        help="explicitly written partition_approval.json")
+                        help="reviewer-written partition_approval.json")
     parser.add_argument("--random-draws", type=int, default=100)
     parser.add_argument("--chunk-size", type=int, default=1024)
     parser.add_argument("--allow-outside-slurm", action="store_true",
@@ -378,7 +378,7 @@ def main():
     collapse_rule_a = {name: runs_summary(r[:k_bin]) for name, r in rankings.items()}
     collapse_rule_a["legacy_msipl"] = runs_summary(legacy_indices)
 
-    # --- Peak-level scoring only under explicitly approved partitions. ---
+    # --- Peak-level scoring only under reviewer-approved partitions. ---
     peak_level = {}
     selections = {}
     prefix_length = 2 * k_bin

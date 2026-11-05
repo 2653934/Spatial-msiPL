@@ -17,7 +17,8 @@ segmentation and the same number of bins, K_bin) against label-free baselines (M
 mean intensity, variance), the original msiPL and S3PL, on three public collections.
 
 This repository accompanies the Honours research report *Spatial Aware Peak Ranking in Mass
-Spectrometry Imaging* (University of the Witwatersrand, 2026), which cites release `v1.0`.
+Spectrometry Imaging* (University of the Witwatersrand, 2026). Release `v1.0` was the first
+cited; `v1.1` adds the label-free K analysis and two report figures (see below).
 It contains only the code that produces the report's tables and figures, the small summary
 files they are built from, and a check that the scripts rebuild them. Exploratory and
 superseded analyses are kept in the private research repository and are not part of this
@@ -125,7 +126,11 @@ and every script refuses to overwrite an existing output.
 10. **S3PL**: `baselines/s3pl/slurm_jobs/` (CAC, GBM, RCC and the seed runs).
 11. **Training length** (scores and loss at epochs 10/25/50/100 on the development
     sections): `submit_training_length.sh`, then `scripts/summarise_training_length.py`.
-12. **Summaries, tables and figures** (local, no GPU): the summarisers below, then
+12. **Label-free K** (GMM K chosen by BIC instead of the class count; seed 1):
+    `submit_label_free_k.sh bic …`, then `submit_label_free_k.sh ig 64 …` (128–1024 only
+    where IG completeness fails), then `submit_label_free_k.sh fair …`, then
+    `scripts/summarise_label_free_k.py`.
+13. **Summaries, tables and figures** (local, no GPU): the summarisers below, then
     `python tools/check_regeneration.py`.
 
 Tests: `python -m unittest discover -s src -t src` with `PYTHONPATH=src:scripts`
@@ -147,17 +152,58 @@ run from `baselines/s3pl` with `python -m unittest discover tests`.
 | Figure: neighbourhood variants | `report_figures/seed_averaged_figures.py` | the Test R table and `…/extra_arms/decisions_20261016_local/` |
 | Figure: VAE vs PCA | `report_figures/seed_averaged_figures.py` | `diagnostics/segmentation_control_V/decisions_20261030_with_test_r_ig_steps_local/` |
 | Figure: S3PL seed variation | `scripts/plot_s3pl_seed_distributions.py` (`--root results/diagnostics/s3pl_seed_investigation_21`) | `diagnostics/s3pl_seed_investigation_21/{part_a_released,part_b}/` |
-| Table and figure: runtime | `report_figures/runtime_figure.py`, `scripts/summarise_runtime_hardware.py` | `diagnostics/ranking_stage_runtime*/`, `publication/current_evidence/runtime_all_sections_v2.csv`, `diagnostics/runtime_hardware_20261030_local/` |
+| Figure: runtime (whole workflow, CAC 160TopL, three repeats) | `report_figures/runtime_figure.py` | `comparisons/s3pl_gbm_stability_runtime/runtime_repeats.csv` |
+| Text: runtime (ranking stage, hardware) | `scripts/summarise_runtime_hardware.py` | `diagnostics/ranking_stage_runtime*/`, `publication/current_evidence/runtime_all_sections_v2.csv`, `diagnostics/runtime_hardware_20261030_local/` |
 | Text: VAE training length | `scripts/summarise_training_length.py` | `diagnostics/fair_scoring_baselines/training_length_20261030/decisions_20261031_local/` |
+| Table: label-free K (Table IV); Section V-H | `scripts/summarise_label_free_k.py` | inputs: `experiments/label_free_k_20261104/`, `diagnostics/fair_scoring_baselines/label_free_k_20261104/bin_level_only/`, the seed-1 production summaries under `diagnostics/ig_steps_20261030/composite_root/`, `diagnostics/gate_d_bic*/`; output: `diagnostics/fair_scoring_baselines/label_free_k_20261104/decisions_20261104_local/` |
+| Figure: qualitative example (GBM39_2) | `report_figures/qualitative_example.py` | `diagnostics/dataset_contact_20261031/GBM39_2.npz`, the K = 2 and K = 6 `coordinates_and_gmm.npz`, `visualisations/qualitative_example/`, the label-free K `per_section.csv` |
+
+## Label-free K analysis (added in v1.1)
+
+The GMM's K normally equals the number of annotated classes, so the segmentation is
+label-free in training and ranking but class-informed in its component count. This
+analysis repeats the ranking comparison with K chosen without labels: BIC on the saved
+seed-1 latent means (candidates K = 1–6), GMM refitted at that K, IG and posterior
+correlation recomputed from the same trained models, and everything scored by the
+unchanged fair evaluator at the same K_bin (bin level, all classes). BIC chose K = 6, the
+largest value tested, in all 48 section-arms. The predeclared rule asks whether
+correlation still beats IG in at least 7 of 8 sections; the rankings that do not depend
+on K (mean intensity, variance, Moran's I, the oracle and legacy msiPL) must reproduce
+their earlier scores exactly, and did. The rule held on CAC and RCC in both arms but not
+on GBM (2/8 and 5/8 sections), where correlation and IG became about equal. The decision
+table is
+`results/diagnostics/fair_scoring_baselines/label_free_k_20261104/decisions_20261104_local/`
+(`decisions.json`, `per_section.csv`); Table IV of the report is built from it.
+
+Code: `scripts/resolve_label_free_k.py` (reads K from the BIC record), the opt-in
+`--no-component-mapping` of `scripts/evaluate_spatial_msipl_attributed_peaks.py` (ARI and
+NMI only when K differs from the class count; the default path is unchanged, tested
+against the v1.0 copy), a figure palette in `scripts/run_spatial_msipl_gmm_integrated_gradients.py`
+that covers K = 6, `scripts/summarise_label_free_k.py`, the `*label_free_k*.sh` jobs and
+`src/spatial_msipl/tests/test_label_free_k.py`.
+
+**New figures in v1.1.** `report_figures/qualitative_example.py` draws the expert mask and
+the K = 2 and K = 6 segmentations of GBM39_2, the section a rule fixed before plotting
+selects (the fourth of the eight GBM sections ordered by IG minus correlation at class K);
+it recomputes that order and refuses any other section. `report_figures/runtime_figure.py`
+now draws the whole-workflow comparison (VAE training, GMM fit and IG, peak scoring
+against S3PL) instead of the v1.0 ranking-time and training-cache panels.
 
 `docs/whitelist.tsv` lists every file in this release with its source and its purpose.
 
 **Regeneration check.** `python tools/check_regeneration.py` reruns these scripts on the
 files in `results/` and compares the outputs with the saved summaries (numbers to 1e-12)
 and with the report's figures (PNG byte-identical; PDF identical apart from creation dates,
-document IDs and byte offsets). It needs `pdflatex` for the runtime figure. All 12 checks
-pass for this release. Numerical result fields are copied unchanged; private provenance
-paths, node names and internal process notes are replaced by documented placeholders.
+document IDs and byte offsets). It also checks the values the report prints from the
+label-free K table and the two new figures. It needs `pdflatex` for the runtime figure.
+Figure digests are those of the environment in `environment/spatial_msipl.yml`
+(matplotlib 3.11.2) with MiKTeX pdfTeX 1.40.29; another matplotlib or TeX version draws the
+same figure with different bytes. All 17 checks pass for this release. Numerical result
+fields are copied unchanged; private provenance paths, node names and internal process
+notes are replaced by documented placeholders (`<project-root>`, `<data-root>`,
+`<checkpoint-root>`, `<compute-node>`). The label-free K check therefore compares
+recorded paths with `/` separators and skips `production_reference_sha256`, which hashes
+the private copy of each production summary before its paths were replaced.
 
 ## Licences
 
@@ -180,10 +226,10 @@ msiPL and S3PL papers:
 ```bibtex
 @thesis{suliman2026spatialmsipl,
   author = {Suliman, Zayd},
-  title  = {Spatial Aware Peak Ranking in Mass Spectrometry Imaging},
+  title  = {Spatially Aware Peak Ranking in Mass Spectrometry Imaging},
   school = {University of the Witwatersrand},
   type   = {Honours research report},
   year   = {2026},
-  note   = {Code: https://github.com/2653934/Spatial-msiPL, release v1.0}
+  note   = {Code: https://github.com/2653934/Spatial-msiPL, release v1.1}
 }
 ```

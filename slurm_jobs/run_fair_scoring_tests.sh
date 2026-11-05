@@ -47,16 +47,14 @@ PY
     spatial_msipl.tests.test_centre_masking \
     spatial_msipl.tests.test_neighbourhood \
     spatial_msipl.tests.test_rcc_pipeline \
-    spatial_msipl.tests.test_spatial_segmentation \
     spatial_msipl.tests.test_test_r \
     spatial_msipl.tests.test_ig_steps \
     spatial_msipl.tests.test_msipl_retune \
     spatial_msipl.tests.test_training_length \
+    spatial_msipl.tests.test_label_free_k \
     spatial_msipl.tests.test_ranking_stage_runtime \
     spatial_msipl.tests.test_runtime_v2 \
     spatial_msipl.tests.test_segmentation_control_v \
-    spatial_msipl.tests.test_pca_reconstruction_v \
-    spatial_msipl.tests.test_s3pl_shuffle_control \
     2>&1 | tee "$RECORD_DIR/${SLURM_JOB_ID}_unittest.log"
 # Test N (protocol 18 Section 6.5): the S3PL patch tests run from the S3PL folder,
 # where m2aia, pyimzml and torch let the real-m2aia and training-call tests run.
